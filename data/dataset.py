@@ -39,8 +39,7 @@ class DualStreamDataset(Dataset):
         # Band 0~8
         factors = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0] 
         
-        # 🔥🔥🔥 核心修复：增加一个维度以匹配 [C, T, H, W]
-        # 变成 [9, 1, 1, 1]
+        # 🔥 核心修复：增加一个维度以匹配 [C, T, H, W] -> [9, 1, 1, 1]
         self.aux_factors = torch.tensor(factors).float().view(9, 1, 1, 1)
 
         self.samples = []
@@ -48,9 +47,20 @@ class DualStreamDataset(Dataset):
             for i in range(len(self.all_years) - self.window + 1):
                 years = list(self.all_years[i : i+self.window])
                 self.samples.append({'patch_idx': idx, 'years': years})
+        
+        # 🔥🔥🔥 优化点 1：初始化文件句柄缓存字典
+        self.file_cache = {}
 
     def __len__(self):
         return len(self.samples)
+
+    # 🔥🔥🔥 优化点 2：定义带缓存的读取函数
+    def _load_npy(self, path):
+        if path not in self.file_cache:
+            # 只有第一次读取时打开文件，之后永久复用这个句柄
+            # mmap_mode='r' 表示只建立映射，不全读进内存，省内存
+            self.file_cache[path] = np.load(path, mmap_mode='r')
+        return self.file_cache[path]
 
     def __getitem__(self, index):
         item = self.samples[index]
@@ -64,11 +74,22 @@ class DualStreamDataset(Dataset):
             x_path = os.path.join(self.data_dir, f"X_{y}.npy")
             y_path = os.path.join(self.data_dir, f"Y_{y}.npy")
             try:
-                x_data = np.load(x_path, mmap_mode='r')[p_idx]
-                y_data = np.load(y_path, mmap_mode='r')[p_idx]
+                # 🔥🔥🔥 优化点 3：使用 _load_npy 获取句柄
+                # 这步操作耗时接近 0，不再频繁打开/关闭文件
+                x_all = self._load_npy(x_path)
+                y_all = self._load_npy(y_path)
+                
+                # 🔥🔥🔥 优化点 4：显式拷贝数据到内存
+                # 从 mmap 中切片读取，并转为 numpy array
+                # 这一步是真正发生 IO 的地方，但因为文件已经打开，速度极快
+                x_data = np.array(x_all[p_idx]) 
+                y_data = np.array(y_all[p_idx])
+                
             except Exception:
+                # 遇到坏数据给个全0，防止训练中断
                 x_data = np.zeros((9, 128, 128), dtype=np.float32)
                 y_data = np.zeros((1, 128, 128), dtype=np.float32)
+                
             feat_stack.append(x_data)
             coarse_stack.append(y_data)
         
@@ -81,8 +102,7 @@ class DualStreamDataset(Dataset):
         coarse_tensor = torch.nan_to_num(coarse_tensor, nan=0.0)
         
         # --- Aux 处理 ---
-        # 1. 通用归一化 (大部分是除以1)
-        # 此时 self.aux_factors 是 [9, 1, 1, 1]，可以完美广播到 [9, 3, 128, 128]
+        # 1. 通用归一化
         feat_norm = feat_tensor / self.aux_factors
         
         # 2. Band 1 (道路) 单独处理
@@ -90,8 +110,7 @@ class DualStreamDataset(Dataset):
         # 3. Band 6 (夜光) Log 处理
         feat_norm[6] = torch.log1p(feat_tensor[6]) / NORM_NTL_LOG
         
-        # --- 🔥 Main (碳排放) Log 处理 ---
-        # 核心修改：使用 log1p 压缩动态范围，避免小数值丢失
+        # --- Main (碳排放) Log 处理 ---
         coarse_norm = torch.log1p(coarse_tensor) / NORM_MAIN_LOG
         
         return feat_norm, coarse_norm, coarse_norm
