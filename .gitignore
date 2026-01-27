@@ -1,22 +1,10 @@
-# python 缓存
 __pycache__/
-*.py[cod]
-
-# IDE 配置 (不需要上传给别人看)
-.vscode/
-.idea/
-
-# 巨大的文件 (防止误传)
+*.pyc
 *.pth
-*.npy
-*.tiff  
-*.rar
-
-# 你的训练日志或检查点 (如果它们在项目文件夹内)
-checkpoints/
-logs/
-results/
-
-# 排除系统文件
+*.tar
 .DS_Store
-Thumbs.db
+.vscode/
+miopen_cache/
+venv/
+Checkpoints/
+Train_Data_Yearly_Coords/

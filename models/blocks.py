@@ -151,3 +151,133 @@ class FrequencyHardConstraint(nn.Module):
         output = torch.fft.ifftn(fft_fused, dim=(-2, -1)).real
         
         return output
+    
+
+    # [追加到 models/blocks.py]
+
+# ==========================================
+# 🆕 新增模块 1: MoE (Mixture of Experts)
+# ==========================================
+class MoEBlock(nn.Module):
+    """
+    稀疏混合专家模块 (Sparse MoE)
+    用途：替换普通卷积层，增加模型容量但保持低计算量。
+    """
+    def __init__(self, dim, num_experts=4, top_k=2):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        
+        # 门控网络 (Gating Network): 决定用哪个专家
+        self.gate = nn.Linear(dim, num_experts)
+        
+        # 专家网络 (Experts): 这里用简单的 1x1 卷积代替 MLP
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv3d(dim, dim, 1),
+                nn.PReLU(),
+                nn.Conv3d(dim, dim, 1)
+            ) for _ in range(num_experts)
+        ])
+        
+    def forward(self, x):
+        # x: [B, C, T, H, W]
+        b, c, t, h, w = x.shape
+        
+        # 1. 计算路由权重
+        # 先把空间时间维度展平做 attention
+        x_flat = x.permute(0, 2, 3, 4, 1).reshape(-1, c) # [N, C]
+        logits = self.gate(x_flat) # [N, num_experts]
+        
+        # 2. 选出 Top-K 专家
+        probs, indices = torch.topk(logits, self.top_k, dim=1)
+        probs = F.softmax(probs, dim=1)
+        
+        # 3. 动态聚合
+        # 为了代码简单且兼容性好，这里用循环实现（虽然慢一点点，但稳）
+        out = torch.zeros_like(x_flat)
+        
+        for k in range(self.top_k):
+            expert_idx = indices[:, k] # 当前第k个选择的专家索引
+            prob = probs[:, k].unsqueeze(1) # 权重
+            
+            # 这里的 mask 稍微有点耗时，工程化通常会用 scatter
+            # 但针对小 Batch 训练，直接遍历专家更直观
+            for i in range(self.num_experts):
+                # 找到所有选择了专家 i 的样本位置
+                mask = (expert_idx == i)
+                if mask.any():
+                    # 提取这些样本
+                    selected_x = x_flat[mask]
+                    # 还原成 3D 形状送入卷积 [Batch_sub, C, 1, 1, 1] 模拟
+                    # 注意：为了让 3D 卷积能处理，我们需要 reshape 回去
+                    # 这里简化处理：直接用 Linear 模拟 1x1 卷积效果
+                    # 真正的 MoE 卷积需要更复杂的 scatter/gather
+                    # 下面是逻辑等效的简化版：
+                    
+                    # 重新构造 expert 的 forward
+                    # 由于我们上面定义的是 Conv3d，这里为了对齐形状：
+                    inp_sub = selected_x.view(-1, c, 1, 1, 1)
+                    out_sub = self.experts[i](inp_sub).view(-1, c)
+                    
+                    # 累加结果
+                    out[mask] += out_sub * prob[mask]
+                    
+        return out.view(b, t, h, w, c).permute(0, 4, 1, 2, 3) + x # 残差连接
+
+# ==========================================
+# 🆕 新增模块 2: Mamba-like Block (纯 PyTorch 版)
+# ==========================================
+class SimpleMambaBlock(nn.Module):
+    """
+    简化版 Mamba 块 (无需安装 mamba-ssm 库，适配 AMD)
+    使用 门控卷积 + 深度可分离卷积 模拟 SSM 的选择性机制
+    """
+    def __init__(self, dim, d_state=16):
+        super().__init__()
+        self.dim = dim
+        
+        # 1. 输入投影
+        self.in_proj = nn.Conv3d(dim, dim * 2, 1)
+        
+        # 2. 深度卷积 (模拟 SSM 的长期记忆)
+        self.conv = nn.Conv3d(dim, dim, 3, 1, 1, groups=dim)
+        
+        # 3. 状态投影 (模拟 SSM 的参数离散化)
+        self.x_proj = nn.Linear(dim, d_state + dim * 2) 
+        
+        # 4. 门控机制
+        self.act = nn.SiLU()
+        
+        # 5. 输出投影
+        self.out_proj = nn.Conv3d(dim, dim, 1)
+
+    def forward(self, x):
+        # x: [B, C, T, H, W]
+        residual = x
+        b, c, t, h, w = x.shape
+        
+        # 1. 投影分为两支: x (信号) 和 z (门)
+        xz = self.in_proj(x)
+        x_signal, z_gate = torch.chunk(xz, 2, dim=1)
+        
+        # 2. 处理信号支 (Conv -> SiLU)
+        x_signal = self.conv(x_signal)
+        x_signal = self.act(x_signal)
+        
+        # 3. 简化版 SSM 操作 (用 门控注意力 模拟)
+        # 真正的 Mamba 这里是 scan 操作，这里我们用 Global Avg 模拟状态选择
+        x_flat = x_signal.mean(dim=[2,3,4]) # [B, C] 全局描述符
+        params = self.x_proj(x_flat) # [B, d_state + 2*dim]
+        
+        # 动态调整特征 (Selective Scan 的平替)
+        dt, B_state, C_state = torch.split(params, [c, c, 16], dim=1)
+        dt = torch.sigmoid(dt).view(b, c, 1, 1, 1)
+        
+        y = x_signal * dt # 这种“软门控”模拟了选择性遗忘
+        
+        # 4. 门控融合
+        y = y * self.act(z_gate)
+        
+        # 5. 输出
+        return self.out_proj(y) + residual
