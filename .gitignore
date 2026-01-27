@@ -1,0 +1,24 @@
+# python 缓存
+__pycache__/
+*.py[cod]
+
+# IDE 配置 (不需要上传给别人看)
+.vscode/
+.idea/
+
+# 巨大的文件 (防止误传)
+*.pth
+*.npy
+*.tiff
+*.tif
+*.zip
+*.rar
+
+# 你的训练日志或检查点 (如果它们在项目文件夹内)
+checkpoints/
+logs/
+results/
+
+# 排除系统文件
+.DS_Store
+Thumbs.db
