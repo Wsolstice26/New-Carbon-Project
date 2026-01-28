@@ -3,4 +3,4 @@
 /Checkpoints/
 __pycache__/
 *.npy
-/Configs/split_config.json
+/Configs/split_config.jsonvenv/
