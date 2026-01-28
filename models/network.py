@@ -3,8 +3,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-# 记得导入新写的类
-from .blocks import MultiScaleBlock3D, SFTLayer3D, EfficientContextBlock, FrequencyHardConstraint, MoEBlock, SimpleMambaBlock
+
+# ✅ 修改1: 从 blocks 里删掉了 SimpleMambaBlock，只保留其他的
+from .blocks import MultiScaleBlock3D, SFTLayer3D, EfficientContextBlock, FrequencyHardConstraint, MoEBlock
+
+# ✅ 修改2: 导入官方 Mamba 库
+from mamba_ssm import Mamba
 
 # 保持 ConvBlock3D 不变
 class ConvBlock3D(nn.Module):
@@ -38,9 +42,16 @@ class DSTCarbonFormer(nn.Module):
         self.moe_block = MoEBlock(dim, num_experts=3, top_k=1) # 使用 MoE 替代普通 ResBlock
         
         # 4. 全局上下文 -> 升级为 Mamba 增强
-        # 原来的 EfficientContextBlock 保留，但在其后串联一个 Mamba 块
         self.global_context = EfficientContextBlock(dim)
-        self.mamba_block = SimpleMambaBlock(dim) # 🔥 新增 Mamba 块
+        
+        # ✅ 修改3: 使用官方 Mamba 初始化
+        # 这里的 dim 对应输入通道数 (d_model)
+        self.mamba_block = Mamba(
+            d_model=dim, 
+            d_state=16,  # 内部状态维度，官方默认16
+            d_conv=4,    # 局部卷积宽度，官方默认4
+            expand=2     # 扩展系数，官方默认2
+        )
         
         # 5. 重建层
         self.tail = nn.Sequential(
@@ -69,7 +80,24 @@ class DSTCarbonFormer(nn.Module):
         
         # Global Context (Mamba)
         f_global = self.global_context(f_main)
-        f_mamba = self.mamba_block(f_global) # 🔥 经过 Mamba 进一步建模长程依赖
+        
+        # ✅ 修改4: 数据形状适配 (关键步骤)
+        # 官方 Mamba 需要 (Batch, Length, Dim) 的输入
+        # 我们的 f_global 是 3D 图像格式 (Batch, Dim, T, H, W)
+        # 所以必须把 T, H, W 展平 (Flatten) 才能喂进去
+        
+        B, C, T, H, W = f_global.shape
+        
+        # 1. 变形: (B, C, T, H, W) -> (B, C, T*H*W) -> (B, T*H*W, C)
+        x_mamba = f_global.flatten(2).transpose(1, 2)
+        
+        # 2. 进官方 Mamba 跑一圈 (享受 CUDA 加速)
+        x_mamba = self.mamba_block(x_mamba)
+        
+        # 3. 还原: (B, T*H*W, C) -> (B, C, T*H*W) -> (B, C, T, H, W)
+        f_mamba = x_mamba.transpose(1, 2).view(B, C, T, H, W)
+        
+        # ---------------------------------------------
         
         f_final = f_main + f_mamba
         

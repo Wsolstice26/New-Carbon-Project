@@ -22,19 +22,55 @@ torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.deterministic = False
 
 # ==========================================
-# 导入项目模块 (请确保你在 /workspace 目录下运行)
+# 导入项目模块
 # ==========================================
 try:
     from models.blocks import (
         MultiScaleBlock3D, SFTLayer3D, EfficientContextBlock, 
-        MoEBlock, SimpleMambaBlock    
+        MoEBlock
+        # SimpleMambaBlock  <-- 已移除旧版
     )
     from models.losses import HybridLoss
     from models.network import DSTCarbonFormer 
+    
+    # ✅ 导入官方 Mamba
+    from mamba_ssm import Mamba
+    
 except ImportError as e:
     print(f"❌ 导入失败: {e}。请确认你在项目根目录运行此脚本。")
     exit()
 
+# ==========================================
+# 🛠️ Mamba 形状适配器 (用于单独测试模块)
+# ==========================================
+class MambaAdapter(nn.Module):
+    """
+    官方 Mamba 需要 (B, L, D) 输入，而我们的数据是 (B, C, T, H, W)。
+    这个类专门用于 benchmark 单独的 Mamba 模块，负责形状转换。
+    """
+    def __init__(self, dim):
+        super().__init__()
+        # 使用官方 Mamba 初始化
+        self.mamba = Mamba(
+            d_model=dim, 
+            d_state=16, 
+            d_conv=4, 
+            expand=2
+        )
+
+    def forward(self, x):
+        # x: (B, C, T, H, W)
+        B, C, T, H, W = x.shape
+        # 展平: (B, C, L) -> (B, L, C)
+        x_flat = x.flatten(2).transpose(1, 2)
+        # 进官方 Mamba
+        out = self.mamba(x_flat)
+        # 还原: (B, L, C) -> (B, C, T, H, W)
+        return out.transpose(1, 2).view(B, C, T, H, W)
+
+# ==========================================
+# 测试函数
+# ==========================================
 def benchmark(name, module, inputs, iters=50):
     print(f"--------------------------------------------------")
     print(f"🧪 测试模块: {name}")
@@ -52,7 +88,7 @@ def benchmark(name, module, inputs, iters=50):
         # 1. 预热 (寻找最佳算法)
         print("   🔥 预热中 (AMD 显卡正在匹配最佳算子)...")
         with torch.no_grad():
-            for _ in range(10): # 增加预热次数让 MIOpen 完成搜索
+            for _ in range(15): # 增加预热次数让 MIOpen 完成搜索
                 _ = module(*inputs)
         torch.cuda.synchronize()
         
@@ -72,6 +108,9 @@ def benchmark(name, module, inputs, iters=50):
 
     except Exception as e:
         print(f"   ❌ 测试失败: {e}")
+        # 打印更详细的错误栈以便调试
+        import traceback
+        traceback.print_exc()
         return float('inf')
 
 if __name__ == "__main__":
@@ -79,8 +118,8 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         gpu_name = torch.cuda.get_device_name(0)
         print(f"\n🔥 硬件就绪: {gpu_name}")
-        # 如果是 9060 XT，显存应该显示为 16GB 左右
         print(f"📦 显存总量: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+        print("✅ 检测到 RDNA 架构，已启用 MIOPEN 优化补丁")
     
     # 设定参数：匹配你的 Carbon_SR_Project 实际数据
     B, T, H, W = 4, 3, 128, 128
@@ -101,19 +140,20 @@ if __name__ == "__main__":
         results['MultiScaleBlock (3D Conv)'] = benchmark("3D卷积模块", MultiScaleBlock3D(channels=DIM), df)
         results['MoE Block (Expert)'] = benchmark("MoE专家模块", MoEBlock(dim=DIM, num_experts=3, top_k=1), df)
         
-        # 重点关注：这个 Mamba 模块现在跑的是 Python 补丁版
-        results['Mamba Block (SSM)'] = benchmark("Mamba模块(补丁版)", SimpleMambaBlock(dim=DIM), df)
+        # ✅ 重点关注：使用适配器测试官方 Mamba
+        results['Official Mamba (ROCm/C++)'] = benchmark("官方Mamba(硬件加速)", MambaAdapter(dim=DIM), df)
 
         results['SFT Fusion'] = benchmark("特征融合模块", SFTLayer3D(channels=DIM), (df, da))
         results['Context Attn'] = benchmark("上下文注意力", EfficientContextBlock(dim=DIM), df)
 
         # 2. 完整模型测试
+        # 这里会调用我们在 network.py 里改好的代码
         full_model = DSTCarbonFormer(aux_c=9, main_c=1, dim=DIM)
         results['>>> FULL MODEL'] = benchmark("DSTCarbonFormer全网测试", full_model, (dra, dm))
 
         # 3. 性能排行榜
         print("\n" + "="*50)
-        print("📊 模块速度排行榜 (14600K + 9060 XT)")
+        print("📊 模块速度排行榜 (14600K + RX 9060 XT)")
         print("="*50)
         
         valid_res = sorted({k: v for k, v in results.items() if v != float('inf')}.items(), key=lambda x: x[1])

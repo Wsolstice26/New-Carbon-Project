@@ -6,12 +6,12 @@ from tqdm import tqdm
 import time
 
 # ==========================================
-# ⚙️ 配置：路径必须与 Docker 挂载点一致
+# ⚙️ 配置：修改为 Linux 真实路径
 # ==========================================
-# 你的数据挂载到了 /train_data
-DATA_DIR = "/train_data" 
-# 配置文件应放在工作区的 Configs 目录下
-CONFIG_DIR = "/workspace/Configs"
+# 你的真实数据存放位置
+DATA_DIR = "/home/wdc/Carbon-Emission-Super-Resolution/data/Train_Data_Yearly_Coords" 
+# 配置文件生成的目录
+CONFIG_DIR = "/home/wdc/Carbon-Emission-Super-Resolution/Configs"
 
 def generate_split_config():
     print(f"🚀 准备开始处理...")
@@ -20,16 +20,28 @@ def generate_split_config():
     with tqdm(total=steps, desc="正在初始化", unit="step") as pbar:
         # --- 步骤 1: 扫描文件 ---
         pbar.set_description("📂 步骤 1/4: 扫描文件头信息")
-        # 确保容器能看到这个文件
+        
+        # 你的文件夹里应该有类似 X_2014.npy, X_2015.npy 等文件
+        # 我们用其中一个来读取总数据量 (total_patches)
+        # 如果你的文件名不同，请检查 DATA_DIR 下的文件
         ref_file = os.path.join(DATA_DIR, "X_2014.npy")
         
         if not os.path.exists(ref_file):
-            print(f"\n❌ 错误：在 {DATA_DIR} 中找不到 X_2014.npy。请确认 Docker 挂载路径。")
-            return
+            print(f"\n❌ 错误：在 {DATA_DIR} 中找不到 X_2014.npy。")
+            print("请确认你的 .npy 文件名是否正确 (例如是否叫 X_2014.npy 或其他年份)。")
+            # 尝试自动寻找一个 .npy 文件作为替代
+            npy_files = [f for f in os.listdir(DATA_DIR) if f.startswith("X_") and f.endswith(".npy")]
+            if npy_files:
+                ref_file = os.path.join(DATA_DIR, npy_files[0])
+                print(f"🔄 自动切换到: {npy_files[0]}")
+            else:
+                return
             
         try:
+            # mmap_mode='r' 允许读取大文件而不加载进内存
             data = np.load(ref_file, mmap_mode='r')
             total_patches = data.shape[0]
+            print(f"   📊 检测到每个文件包含 {total_patches} 个样本")
         except Exception as e:
             print(f"\n❌ 读取文件出错: {e}")
             return
@@ -62,7 +74,7 @@ def generate_split_config():
         }
 
         if not os.path.exists(CONFIG_DIR):
-            os.makedirs(CONFIG_DIR)
+            os.makedirs(CONFIG_DIR, exist_ok=True)
             
         out_path = os.path.join(CONFIG_DIR, "split_config.json")
         
@@ -72,6 +84,7 @@ def generate_split_config():
         pbar.update(1)
 
     print(f"\n✅ 处理完成！配置文件已保存至: {out_path}")
+    print(f"👉 现在的训练集数量: {len(train_idx)}, 验证集: {len(val_idx)}, 测试集: {len(test_idx)}")
 
 if __name__ == "__main__":
     generate_split_config()

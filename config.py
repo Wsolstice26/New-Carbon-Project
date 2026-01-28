@@ -1,24 +1,26 @@
+# config.py
+
 CONFIG = {
-    # ==========================
-    # 1. 路径设置 (针对 Docker 环境)
-    # ==========================
-    "data_dir": "/train_data",
-    "split_config": "/workspace/Configs/split_config.json",
-    "save_dir": "/workspace/Checkpoints/DST_Experiment_01",
+    # 路径保持不变
+    "data_dir": "/home/wdc/Carbon-Emission-Super-Resolution/data/Train_Data_Yearly_Coords",
+    "split_config": "/home/wdc/Carbon-Emission-Super-Resolution/Configs/split_config.json",
+    "save_dir": "/home/wdc/Carbon-Emission-Super-Resolution/Checkpoints/DST_Experiment_01",
     
     # ==========================
-    # 2. 训练超参数
+    # 🔴 关键修改 1: 显存救星
     # ==========================
-    "batch_size": 32, # RX 9060 XT 16G 显存的推荐配置
-    "lr": 1e-4,
+    # 关闭 AMP 后显存占用翻倍，必须降到 8 (甚至 4)
+    "batch_size": 12, 
+    
+    # ==========================
+    # 🔴 关键修改 2: 稳定训练
+    # ==========================
+    # 降低学习率，防止梯度爆炸
+    "lr": 5e-5,  
+    
     "epochs": 100,
-    
-    # ==========================
-    # 3. 其他设置
-    # ==========================
-    "resume": False, 
+    "resume": True,    
     "patience": 15,
-    
     "num_workers": 8,
     "save_freq": 5,
 }

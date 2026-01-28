@@ -5,16 +5,16 @@ import os
 # ==========================================
 # 强制使用 GEMM 算法 (最稳，绝对不崩，MoE 必备)
 os.environ['MIOPEN_DEBUG_CONV_GEMM'] = '1'
-# 屏蔽警告
+# 屏蔽 MIOpen 烦人的警告日志
 os.environ['MIOPEN_LOG_LEVEL'] = '2' 
 os.environ['MIOPEN_ENABLE_LOGGING'] = '0'
+# 指定缓存路径，防止权限问题
 os.environ['MIOPEN_USER_DB_PATH'] = './miopen_cache'
-
+os.environ['PYTORCH_ALLOC_CONF'] = 'expandable_segments:True'
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-# [修改 1] 移除旧的 amp 导入，直接用 torch.amp
 from tqdm import tqdm
 import time
 import glob
@@ -24,13 +24,24 @@ import numpy as np
 from data.dataset import DualStreamDataset
 from models.network import DSTCarbonFormer
 from models.losses import HybridLoss
-from config import CONFIG
+from config import CONFIG  # <--- 直接从文件导入配置
 
 NORM_FACTOR = 11.0
 
 def get_latest_checkpoint(save_dir):
+    """
+    优先寻找 latest.pth (由脚本自动每轮保存)，
+    如果找不到，再寻找 epoch_*.pth
+    """
     if not os.path.exists(save_dir):
         return None
+    
+    # 1. 优先找 latest.pth
+    latest_path = os.path.join(save_dir, "latest.pth")
+    if os.path.exists(latest_path):
+        return latest_path
+
+    # 2. 找不到再找历史存档
     files = glob.glob(os.path.join(save_dir, "epoch_*.pth"))
     if not files:
         return None
@@ -46,12 +57,11 @@ def train():
     if torch.cuda.is_available():
         print(f"   显卡型号: {torch.cuda.get_device_name(0)}")
         
-        # [MoE 关键设置] 必须关闭 Benchmark，否则 MoE 动态形状会导致崩溃
+        # [MoE 关键设置] 关闭 Benchmark 防止动态形状导致崩溃
         torch.backends.cudnn.benchmark = False 
         torch.backends.cudnn.deterministic = True
         print("🛡️ 安全模式已启动: Benchmark=False, GEMM=ON")
     
-    # [修改 2] 使用新版 GradScaler 写法
     scaler = torch.amp.GradScaler('cuda')
     print(f"⚡ 已启用混合精度训练 (AMP)")
 
@@ -61,6 +71,13 @@ def train():
     # 2. 数据准备
     # ----------------------------------------
     print(f"📦 加载数据 (Batch Size: {CONFIG['batch_size']})...")
+    
+    # 双重检查路径
+    if not os.path.exists(CONFIG['data_dir']):
+        print(f"❌ 错误: 数据路径不存在 -> {CONFIG['data_dir']}")
+        print("请检查 config.py 中的路径设置！")
+        return
+
     train_ds = DualStreamDataset(CONFIG['data_dir'], CONFIG['split_config'], 'train')
     val_ds = DualStreamDataset(CONFIG['data_dir'], CONFIG['split_config'], 'val')
     
@@ -72,7 +89,7 @@ def train():
     # ----------------------------------------
     # 3. 模型与优化器
     # ----------------------------------------
-    print("🏗️ 初始化 DSTCarbonFormer 模型 (v1.2)...")
+    print("🏗️ 初始化 DSTCarbonFormer 模型 (v1.3)...")
     model = DSTCarbonFormer(aux_c=9, main_c=1, dim=64).to(device)
     
     print("⚖️ 初始化损失函数...")
@@ -88,7 +105,7 @@ def train():
     best_loss = float('inf')
     early_stop_counter = 0 
     
-    if CONFIG.get('resume', False):
+    if CONFIG['resume']:
         latest_ckpt = get_latest_checkpoint(CONFIG['save_dir'])
         if latest_ckpt:
             print(f"🔄 发现检查点: {latest_ckpt}，正在恢复...")
@@ -125,7 +142,7 @@ def train():
             optimizer.zero_grad()
             
             try:
-                # [修改 3] 使用新版 autocast 写法，指定设备类型 'cuda'
+                # 混合精度前向传播
                 with torch.amp.autocast('cuda'):
                     pred = model(aux, main)
                     loss = criterion(pred, target, input_main=main)
@@ -169,7 +186,6 @@ def train():
                 main = main.to(device)
                 target = target.to(device)
                 
-                # [修改 3] 验证阶段也要改
                 with torch.amp.autocast('cuda'):
                     pred = model(aux, main)
                     val_loss += criterion(pred, target, input_main=main).item()
@@ -193,6 +209,7 @@ def train():
             'early_stop_counter': early_stop_counter
         }
         
+        # 保存最新检查点 (用于 resume)
         torch.save(checkpoint_dict, os.path.join(CONFIG['save_dir'], "latest.pth"))
 
         if avg_val_loss < best_loss:
@@ -205,6 +222,7 @@ def train():
             early_stop_counter += 1
             print(f"   ⏳ Loss 未下降 ({early_stop_counter}/{CONFIG['patience']})")
         
+        # 定期保存历史存档
         if epoch % CONFIG['save_freq'] == 0:
             torch.save(checkpoint_dict, os.path.join(CONFIG['save_dir'], f"epoch_{epoch}.pth"))
             
