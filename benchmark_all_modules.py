@@ -5,37 +5,35 @@ import time
 import numpy as np
 
 # ==========================================
-# 🧪 极限性能模式 (RISKY MODE)
+# 🚀 环境补丁 (针对 14600K + 9060 XT)
 # ==========================================
 
-# 1. [核心修改] 开启 Benchmark
-#    允许 PyTorch 运行一次试跑，来寻找那个需要 300MB 的高性能算法
-#    如果这里卡住不动超过 1 分钟，请立即 Ctrl+C
+# 1. 解决 MIOpen Workspace 报错，强制申请显存空间以换取 3D 卷积速度
+os.environ['MIOPEN_FORCE_USE_WORKSPACE'] = '1'
+# 允许 MIOpen 动态搜索最佳算法（配合 benchmark=True）
+os.environ['MIOPEN_DEBUG_CONV_GEMM'] = '0' 
+
+# 2. 解决 Intel CPU 在容器内可能引发的数学库冲突
+os.environ['MKL_THREADING_LAYER'] = 'GNU'
+os.environ['MKL_SERVICE_FORCE_INTEL'] = '1'
+
+# 3. 开启极限性能模式
 torch.backends.cudnn.benchmark = True  
 torch.backends.cudnn.deterministic = False
 
-# 2. [关键] 告诉 MIOpen 不要因为显存不够就轻易放弃
-#    开启日志，看看它到底选了哪个算法 (Algo 1 是 GEMM，如果变了说明成功)
-os.environ['MIOPEN_ENABLE_LOGGING'] = '1' 
-os.environ['MIOPEN_LOG_LEVEL'] = '3' # 显示 Warning 和 Info
-
-# 3. 解除 GEMM 锁定
-if 'MIOPEN_DEBUG_CONV_GEMM' in os.environ:
-    del os.environ['MIOPEN_DEBUG_CONV_GEMM']
-
 # ==========================================
-# 导入模块
+# 导入项目模块 (请确保你在 /workspace 目录下运行)
 # ==========================================
-from models.blocks import (
-    MultiScaleBlock3D, 
-    SFTLayer3D, 
-    EfficientContextBlock, 
-    FrequencyHardConstraint,
-    MoEBlock,           
-    SimpleMambaBlock    
-)
-from models.losses import HybridLoss
-from models.network import DSTCarbonFormer # 导入主模型
+try:
+    from models.blocks import (
+        MultiScaleBlock3D, SFTLayer3D, EfficientContextBlock, 
+        MoEBlock, SimpleMambaBlock    
+    )
+    from models.losses import HybridLoss
+    from models.network import DSTCarbonFormer 
+except ImportError as e:
+    print(f"❌ 导入失败: {e}。请确认你在项目根目录运行此脚本。")
+    exit()
 
 def benchmark(name, module, inputs, iters=50):
     print(f"--------------------------------------------------")
@@ -46,17 +44,15 @@ def benchmark(name, module, inputs, iters=50):
         module = module.to(device)
         module.eval()
         
-        # 处理输入
         if isinstance(inputs, (tuple, list)):
             inputs = [x.to(device) for x in inputs]
         else:
             inputs = [inputs.to(device)]
             
-        # 1. 预热 (Warmup)
-        # 注意：开启 Benchmark 后，第一次运行会非常慢（因为在搜算法）
-        print("   🔥 预热中 (正在搜索最佳算法)...")
+        # 1. 预热 (寻找最佳算法)
+        print("   🔥 预热中 (AMD 显卡正在匹配最佳算子)...")
         with torch.no_grad():
-            for _ in range(5):
+            for _ in range(10): # 增加预热次数让 MIOpen 完成搜索
                 _ = module(*inputs)
         torch.cuda.synchronize()
         
@@ -67,7 +63,6 @@ def benchmark(name, module, inputs, iters=50):
                 _ = module(*inputs)
         torch.cuda.synchronize()
         
-        # 计算结果
         avg_time = (time.time() - start) / iters * 1000 
         throughput = 1000 / avg_time * inputs[0].shape[0] 
         
@@ -80,75 +75,51 @@ def benchmark(name, module, inputs, iters=50):
         return float('inf')
 
 if __name__ == "__main__":
-    print(f"\n🔥 PyTorch: {torch.__version__}")
+    # 检测硬件
     if torch.cuda.is_available():
-        print(f"🔥 GPU: {torch.cuda.get_device_name(0)}")
-        print("🚀 模式: 极限性能 (Benchmark=ON)")
-    else:
-        print("⚠️ 未检测到 GPU")
-
-    # 设定测试参数
+        gpu_name = torch.cuda.get_device_name(0)
+        print(f"\n🔥 硬件就绪: {gpu_name}")
+        # 如果是 9060 XT，显存应该显示为 16GB 左右
+        print(f"📦 显存总量: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+    
+    # 设定参数：匹配你的 Carbon_SR_Project 实际数据
     B, T, H, W = 4, 3, 128, 128
     DIM = 64 
-    print(f"📦 Batch Size: {B}, Dim: {DIM}, Input: {T}x{H}x{W}")
+    print(f"⚙️ 测试参数: BatchSize={B}, Dim={DIM}, PatchSize={H}x{W}")
     print("-" * 50)
     
-    # 构造假数据
-    dummy_feat = torch.randn(B, DIM, T, H, W)
-    dummy_aux = torch.randn(B, DIM, T, H, W) 
-    dummy_pred = torch.randn(B, 1, T, H, W)
-    dummy_target = torch.randn(B, 1, T, H, W)
-    dummy_raw_aux = torch.randn(B, 9, T, H, W)
-    dummy_raw_main = torch.randn(B, 1, T, H, W)
+    # 构造假数据 (输入通道: aux=9, main=1)
+    df = torch.randn(B, DIM, T, H, W)
+    da = torch.randn(B, DIM, T, H, W) 
+    dra = torch.randn(B, 9, T, H, W)
+    dm = torch.randn(B, 1, T, H, W)
     
     results = {}
 
     try:
-        # ==========================================
-        # 1. 关键组件
-        # ==========================================
-        # 这是成败的关键，看它能否突破 147ms
-        block_ms = MultiScaleBlock3D(channels=DIM)
-        results['MultiScaleBlock (3D Conv)'] = benchmark("MultiScaleBlock3D", block_ms, dummy_feat)
+        # 1. 测试各核心组件
+        results['MultiScaleBlock (3D Conv)'] = benchmark("3D卷积模块", MultiScaleBlock3D(channels=DIM), df)
+        results['MoE Block (Expert)'] = benchmark("MoE专家模块", MoEBlock(dim=DIM, num_experts=3, top_k=1), df)
         
-        block_moe = MoEBlock(dim=DIM, num_experts=3, top_k=1)
-        results['MoE Block (Expert)'] = benchmark("MoEBlock", block_moe, dummy_feat)
-        
-        block_mamba = SimpleMambaBlock(dim=DIM)
-        results['Mamba Block (SSM)'] = benchmark("SimpleMambaBlock", block_mamba, dummy_feat)
+        # 重点关注：这个 Mamba 模块现在跑的是 Python 补丁版
+        results['Mamba Block (SSM)'] = benchmark("Mamba模块(补丁版)", SimpleMambaBlock(dim=DIM), df)
 
-        block_sft = SFTLayer3D(channels=DIM)
-        results['SFT Fusion'] = benchmark("SFTLayer3D", block_sft, (dummy_feat, dummy_aux))
-        
-        block_ctx = EfficientContextBlock(dim=DIM)
-        results['Context Attn'] = benchmark("EfficientContextBlock", block_ctx, dummy_feat)
-        
-        loss_fn = HybridLoss().cuda()
-        results['Hybrid Loss'] = benchmark("HybridLoss", loss_fn, (dummy_pred, dummy_target, dummy_raw_main))
+        results['SFT Fusion'] = benchmark("特征融合模块", SFTLayer3D(channels=DIM), (df, da))
+        results['Context Attn'] = benchmark("上下文注意力", EfficientContextBlock(dim=DIM), df)
 
-        # ==========================================
         # 2. 完整模型测试
-        # ==========================================
-        # 看看这一套组合拳下来的总速度
         full_model = DSTCarbonFormer(aux_c=9, main_c=1, dim=DIM)
-        results['>>> FULL MODEL (DSTCarbonFormer)'] = benchmark("DSTCarbonFormer (Whole Net)", full_model, (dummy_raw_aux, dummy_raw_main))
+        results['>>> FULL MODEL'] = benchmark("DSTCarbonFormer全网测试", full_model, (dra, dm))
 
-        # ==========================================
-        # 3. 排行榜
-        # ==========================================
+        # 3. 性能排行榜
         print("\n" + "="*50)
-        print("📊 模块速度排行榜 (越快越好)")
+        print("📊 模块速度排行榜 (14600K + 9060 XT)")
         print("="*50)
         
-        valid_results = {k: v for k, v in results.items() if v != float('inf')}
-        sorted_res = sorted(valid_results.items(), key=lambda x: x[1])
-        
-        for name, t in sorted_res:
-            bar_len = int(t / 5) if t < 200 else 40
-            bar = "█" * bar_len
-            print(f"{name:<35} : {t:>6.2f} ms  {bar}")
+        valid_res = sorted({k: v for k, v in results.items() if v != float('inf')}.items(), key=lambda x: x[1])
+        for name, t in valid_res:
+            bar = "█" * int(t/5) if t < 200 else "█" * 40
+            print(f"{name:<30} : {t:>7.2f} ms  {bar}")
             
     except Exception as e:
-        print(f"\n❌ 测试中断: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"\n❌ 严重错误: {e}")

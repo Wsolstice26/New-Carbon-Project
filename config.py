@@ -1,22 +1,16 @@
-# E:\superResulotion\Code\Carbon_SR_Project\config.py
-
 CONFIG = {
     # ==========================
-    # 1. 路径设置
+    # 1. 路径设置 (针对 Docker 环境)
     # ==========================
-    "data_dir": r"/workspace/Train_Data_Yearly_Coords",
-    "split_config": r"/workspace/Configs/split_config.json",
-    "save_dir": r"/workspace/Checkpoints/DST_Experiment_01",
+    "data_dir": "/train_data",
+    "split_config": "/workspace/Configs/split_config.json",
+    "save_dir": "/workspace/Checkpoints/DST_Experiment_01",
     
     # ==========================
     # 2. 训练超参数
     # ==========================
-    # 🔥 16G 显存的黄金甜点配置
-    "batch_size": 32,
-    
-    # 学习率
+    "batch_size": 32, # RX 9060 XT 16G 显存的推荐配置
     "lr": 1e-4,
-    
     "epochs": 100,
     
     # ==========================
@@ -25,8 +19,6 @@ CONFIG = {
     "resume": False, 
     "patience": 15,
     
-    # 🔥🔥🔥 核心修改：AMD + Windows 必须设为 0，否则速度起不来
     "num_workers": 8,
-    
     "save_freq": 5,
 }

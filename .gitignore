@@ -1,10 +1,6 @@
+/train_data/
+/data/
+/Checkpoints/
 __pycache__/
-*.pyc
-*.pth
-*.tar
-.DS_Store
-.vscode/
-miopen_cache/
-venv/
-Checkpoints/
-Train_Data_Yearly_Coords/
+*.npy
+/Configs/split_config.json
