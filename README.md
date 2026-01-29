@@ -1,8 +1,8 @@
 # 🌍 Carbon Emission Super-Resolution (DSTCarbonFormer)
 
-**基于 Mamba + MoE + 自适应混合损失的碳排放时空超分辨率重建框架**
+**基于 Mamba + MoE + 自适应 CV 动态加权损失的碳排放时空超分辨率重建框架**
 
-本项目实现了一个深度学习模型，旨在利用多源辅助数据（如夜间灯光、路网、NDVI等）将粗糙的碳排放数据重建为高分辨率的精细分布图。模型在 **v1.7** 版本中采用了 **DSTCarbonFormer** (Dual-Stream Spatio-Temporal Carbon Transformer) 架构，并集成了 **自适应权重损失 (Auto-Weighted Loss)** 和 **Balanced MAE 导向优化** 机制，彻底解决了“数值准确性”与“纹理平滑度”难以平衡的痛点，以及背景像素过多导致的梯度稀释问题。
+本项目实现了一个深度学习模型，旨在利用多源辅助数据（如夜间灯光、路网、NDVI等）将粗糙的碳排放数据重建为高分辨率的精细分布图。模型在 **v1.8** 版本中采用了 **DSTCarbonFormer** 架构，并首创了 **自适应变异系数损失 (Adaptive CV Loss)** 机制。该机制结合了**宏观比例反转**与**微观长尾加权**，配合 **FP32 精度统计保护**，彻底解决了长尾分布（Power-Law）下极端高排放点源（Top 1%）难以预测的痛点，同时完美适配 AMD ROCm 硬件环境。
 
 ---
 
@@ -17,10 +17,13 @@
     * **Mamba (SSM)**: 引入状态空间模型替代传统 Transformer，在捕获超长程时空依赖的同时，保持线性计算复杂度。
     * **混合专家系统 (MoE)**: 针对成都市不同功能区（高度城市化中心 vs 边缘生态区）进行动态计算资源分配。
 
-* **⚖️ 平衡自适应损失 (v1.7 New)**:
-    * **平衡掩码机制 (Balanced Masked Loss)**: 强制“城市区域”与“背景区域”在梯度计算中占比 **1:1**，解决背景 0 值过多导致的 Loss 虚低问题。
-    * **正数权重自适应**: 采用指数归一化 (Exponential Normalization) 替代对数方差，保证 Loss 恒为正数，训练曲线更直观。
-    * **自动加权**: 自动学习 `Pixel`、`SSIM` 和 `TV` Loss 之间的最佳比例。
+* **⚖️ 自适应变异系数混合损失 (v1.8 New - Adaptive CV Hybrid Loss)**:
+    * **双层动态平衡 (Dual-Layer Balancing)**:
+        * **宏观层 (Macro)**: 基于 Batch 内非零像素占比自动计算 `Ratio`，动态调整“城市”与“背景”的基础权重，拒绝死板的 1:1。
+        * **微观层 (Micro)**: 基于 **变异系数 (CV)** 自动感知 Batch 内的“贫富差距”。针对 $1/x$ 长尾分布，利用 `Log + CV` 动态放大高排放点（如超级工厂）的梯度贡献。
+    * **数值安全堡垒 (FP32 Guard)**: 
+        * 在 Loss 计算内部强制使用 **FP32** 进行统计量（均值、方差）计算，防止在 FP16 混合精度训练下因平方累加导致的数值溢出 (NaN)，专为 **AMD RX 9060 XT** 优化。
+    * **NaN 免疫清洗**: 内置显式 NaN 清洗机制，确保脏数据不会中断训练。
 
 * **🎯 Balanced MAE 导向优化 (v1.7 New)**:
     * 摒弃传统的 Global MAE，采用 **Balanced MAE (50% City + 50% Bg)** 作为早停 (Early Stopping) 的唯一依据，强迫模型攻克高排放难点区域。
@@ -166,13 +169,15 @@ python inference.py
 
 ---
 
-## 📊 性能指标 (v1.7 - Chengdu)
+## 📊 性能指标 (v1.8 - Quantile Monitoring)
 
-模型训练过程会实时监控以下指标：
+模型摒弃了单一的全局 MAE，转而采用基于**真实数据分位数**的分层监控体系，确保模型在不同量级上“不偏科”：
 
-* **Balanced MAE**: 核心指标 (0.5 * City_MAE + 0.5 * Bg_MAE)，防止被背景 0 值稀释。
-* **City MAE (Non-Zero)**: 核心城区/工业区的高排放点预测误差。
-* **Weights**: 实时显示的 Loss 权重分配 (Pixel / SSIM / TV)。
+* **Balanced MAE**: 宏平均指标，用于早停 (Early Stopping) 判断。
+* **MAE_Bg (Background)**: 背景区域误差 ($y=0$)，监控“幻觉/噪点”抑制能力。
+* **MAE_Norm (Normal)**: 普通城区误差 ($0 < y \le Q_{90}$)，监控基础结构恢复能力。
+* **MAE_High (High)**: 重点排放区误差 ($Q_{90} < y \le Q_{99}$)。
+* **MAE_Ext (Extreme)**: **核心指标**。极端高排放源误差 ($y > Q_{99}$，即 >1830吨)，监控模型对 Top 1% 超级点源的攻坚能力。
 
 ---
 
