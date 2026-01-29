@@ -32,12 +32,13 @@ def _ssim(img1, img2, window, window_size, channel, size_average=True):
     else: return ssim_map.mean(1).mean(1).mean(1)
 
 # ==========================================
-# 2. 核心损失定义
+# 2. 核心损失模块定义
 # ==========================================
 
 class TVLoss(nn.Module):
     """
-    全变分损失：专门用于平滑图像，消除网格伪影和噪点。
+    全变分损失 (Total Variation Loss)
+    作用：专门用于平滑图像，消除超分辨率中常见的网格伪影和高频噪点。
     """
     def __init__(self, tv_loss_weight=1):
         super(TVLoss, self).__init__()
@@ -49,6 +50,7 @@ class TVLoss(nn.Module):
         w_x = x.size()[3]
         count_h = self._tensor_size(x[:, :, 1:, :])
         count_w = self._tensor_size(x[:, :, :, 1:])
+        # 计算水平和垂直方向的梯度差异
         h_tv = torch.pow((x[:, :, 1:, :] - x[:, :, :h_x - 1, :]), 2).sum()
         w_tv = torch.pow((x[:, :, :, 1:] - x[:, :, :, :w_x - 1]), 2).sum()
         return self.tv_loss_weight * 2 * (h_tv / count_h + w_tv / count_w) / batch_size
@@ -56,22 +58,41 @@ class TVLoss(nn.Module):
     def _tensor_size(self, t):
         return t.size()[1] * t.size()[2] * t.size()[3]
 
-class CharbonnierLoss(nn.Module):
+class BalancedCharbonnierLoss(nn.Module):
     """
-    鲁棒的 L1 Loss 变体，比标准 L1 收敛更稳。
+    🔥 [核心升级] 平衡掩码 Charbonnier Loss
+    作用：
+    1. 使用 Charbonnier (L1变体) 保证数值回归的鲁棒性。
+    2. 引入平衡机制：强制 '城市区域' 和 '背景区域' 对 Loss 的贡献各占 50%。
+       这解决了背景 0 值过多导致梯度被稀释的问题。
     """
     def __init__(self, eps=1e-3):
-        super(CharbonnierLoss, self).__init__()
+        super(BalancedCharbonnierLoss, self).__init__()
         self.eps = eps
     
-    def forward(self, x, y, weight_map=None):
-        diff = x - y
-        loss = torch.sqrt(diff * diff + self.eps * self.eps)
-        if weight_map is not None:
-            loss = loss * weight_map # 重点区域加权
-        return torch.mean(loss)
+    def forward(self, x, y):
+        # 1. 计算基础误差图
+        diff_sq = (x - y)**2
+        loss_map = torch.sqrt(diff_sq + self.eps * self.eps)
+        
+        # 2. 创建非零掩码 (阈值设为 1e-6)
+        mask = (y > 1e-6).float()
+        inv_mask = 1.0 - mask
+        
+        # 3. 分别计算城市和背景的平均 Loss
+        # 加上 1e-8 是为了防止分母为 0 (例如全黑图片)
+        loss_city = (loss_map * mask).sum() / (mask.sum() + 1e-8)
+        loss_bg = (loss_map * inv_mask).sum() / (inv_mask.sum() + 1e-8)
+        
+        # 4. 强制 50/50 平衡
+        # 无论背景面积多大，它只能贡献一半的 Loss
+        return 0.5 * loss_city + 0.5 * loss_bg
 
 class SSIMLoss(torch.nn.Module):
+    """
+    结构相似性损失 (SSIM)
+    作用：保证重建结果在视觉结构（路网、纹理）上与真值一致。
+    """
     def __init__(self, window_size=11, size_average=True):
         super(SSIMLoss, self).__init__()
         self.window_size = window_size
@@ -80,7 +101,7 @@ class SSIMLoss(torch.nn.Module):
         self.window = create_window(window_size, self.channel)
 
     def forward(self, img1, img2):
-        # 适配 5D 输入 (B, C, T, H, W) -> (B*T, C, H, W)
+        # 适配 5D 输入 (B, C, T, H, W) -> 展平为 4D 进行卷积计算
         if img1.dim() == 5:
             b, c, t, h, w = img1.size()
             img1 = img1.view(b * t, c, h, w)
@@ -100,54 +121,51 @@ class SSIMLoss(torch.nn.Module):
         return F.relu(1 - ssim_val)
 
 # ==========================================
-# 3. 自适应混合损失 (Auto-Weighted HybridLoss)
+# 3. 自适应混合损失 (正数权重版)
 # ==========================================
 class HybridLoss(nn.Module):
     def __init__(self):
         super(HybridLoss, self).__init__()
         
-        # 1. 定义具体的 Loss 计算模块
-        self.pixel_loss = CharbonnierLoss()
+        # 初始化三个核心 Loss
+        self.pixel_loss = BalancedCharbonnierLoss() # 升级为平衡版
         self.ssim_loss = SSIMLoss()
         self.tv_loss = TVLoss()
         
-        # 2. 🔥 核心：定义可学习的参数 (Log Variance)
-        # 初始化为 0.0，对应初始权重 = 0.5 (1 / (2*exp(0)))
-        # 我们用 Parameter 包装它，优化器会自动更新它
-        self.log_vars = nn.Parameter(torch.zeros(3))
+        # 🔥 [关键修改] 定义 3 个可学习的权重参数
+        # 初始化为 0.0，这意味着初始时刻 exp(0)=1，即三者权重相等
+        self.w_params = nn.Parameter(torch.zeros(3))
+
+        # 🔥 新增：定义放大倍数 (Scale Factor)
+        # 建议设为 100 或 1000，让 Loss 回到 0.x ~ 1.x 的区间
+        self.loss_scale = 1000.0
 
     def forward(self, pred, target, input_main=None):
-        # 1. 权重地图 (针对高排放区的空间加权，保持不变)
-        mask = (target > 1e-6).float()
-        weight_map = 1.0 + mask * 9.0  # 背景=1.0, 城市=10.0
-        
-        # 2. 计算原始 Loss 值
-        l_pix = self.pixel_loss(pred, target, weight_map=weight_map)
+        # 1. 计算各分项 Loss
+        l_pix = self.pixel_loss(pred, target)
         l_ssim = self.ssim_loss(pred, target)
         
+        # TV Loss 需要处理 5D 数据的 reshape
         if pred.dim() == 5:
             b, c, t, h, w = pred.size()
             l_tv = self.tv_loss(pred.view(b*t, c, h, w))
         else:
             l_tv = self.tv_loss(pred)
             
-        # 3. 🔥 应用不确定性加权 (Kendall et al. CVPR 2018)
-        # Loss = (1 / 2*sigma^2) * L + log(sigma)
-        # 这里 sigma^2 = exp(log_var)
+        # 2. 🔥 权重自适应计算 (Softmax 归一化思想)
+        # 使用 exp 确保权重永远为正数，避免出现负数 Loss
+        weights = torch.exp(self.w_params) 
         
-        # 项 1: Pixel Loss (数值)
-        precision_pix = torch.exp(-self.log_vars[0])
-        loss_pix = 0.5 * precision_pix * l_pix + 0.5 * self.log_vars[0]
+        # 归一化：让权重之和恒等于 3.0
+        # 这样既能保持量级稳定，又能让模型动态调整三者的比例
+        weights = weights / weights.sum() * 3.0
         
-        # 项 2: SSIM Loss (结构)
-        precision_ssim = torch.exp(-self.log_vars[1])
-        loss_ssim = 0.5 * precision_ssim * l_ssim + 0.5 * self.log_vars[1]
+        # 3. 加权求和
+        # weights[0] -> Pixel Loss (数值精度)
+        # weights[1] -> SSIM Loss (结构纹理)
+        # weights[2] -> TV Loss (去网格化)
+        total_loss = (weights[0] * l_pix + 
+                      weights[1] * l_ssim + 
+                      weights[2] * l_tv)
         
-        # 项 3: TV Loss (平滑)
-        precision_tv = torch.exp(-self.log_vars[2])
-        loss_tv = 0.5 * precision_tv * l_tv + 0.5 * self.log_vars[2]
-        
-        # 4. 总和
-        total_loss = loss_pix + loss_ssim + loss_tv
-        
-        return total_loss
+        return total_loss * self.loss_scale
