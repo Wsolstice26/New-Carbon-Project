@@ -1,6 +1,6 @@
 # 🌍 Carbon Emission Super-Resolution (DSTCarbonFormer)
 
-**基于双流时空Transformer的碳排放超分辨率重建框架**
+**基于双流时空 Transformer 的碳排放超分辨率重建框架**
 
 本项目实现了一个深度学习模型，旨在利用多源辅助数据（如夜间灯光、路网、NDVI等）将粗糙的碳排放数据重建为高分辨率的精细分布图。模型采用了 **DSTCarbonFormer** (Dual-Stream Spatio-Temporal Carbon Transformer) 架构，并集成了 **SEN2SR 频率硬约束** 和 **混合物理损失函数**，以确保重建结果在数值上的准确性和空间纹理上的真实性。
 
@@ -8,24 +8,29 @@
 
 ## ✨ 核心特性
 
-* **双流架构 (Dual-Stream)**:
-* **辅助流 (Aux Stream)**: 处理高分辨率的多源辅助数据 (9通道: NTL, Road, Water, NDVI, etc.)。
-* **主流 (Main Stream)**: 处理低分辨率/粗糙的碳排放数据。
-* **SFT 融合**: 使用空间特征变换 (SFT) 层将辅助流的纹理信息注入到主流中。
+* **双流架构 (Dual-Stream) & SFT 融合**:
+* **辅助流 (Aux Stream)**: 处理高分辨率多源辅助数据 (9通道: NTL, Road, Water, NDVI, etc.)。
+* **主流 (Main Stream)**: 处理低分辨率碳排放数据。
+* **SFT 融合**: 使用空间特征变换 (SFT) 层将辅助流的纹理信息动态注入主流中。
+
+
+* **前沿计算架构 (Mamba & MoE)**:
+* **Mamba (SSM)**: 引入状态空间模型替代传统 Transformer，在捕获超长程时空依赖的同时，保持线性计算复杂度。
+* **混合专家系统 (MoE)**: 针对成都市不同功能区（高度城市化中心 vs 边缘生态区）进行动态计算资源分配。
 
 
 * **时空感知 (Spatio-Temporal)**:
-* 采用 `T=3` 的滑动窗口输入，捕捉碳排放的时序演变规律。
+* 采用  的滑动窗口输入，捕捉碳排放的时序演变规律。
 * 集成 **Efficient Global Context Block** 进行全局信息建模。
 
 
 * **频率硬约束 (FFT Constraint)**:
-* 引入 SEN2SR 的频率域约束，强制模型保留低频的宏观数值准确性，同时恢复高频纹理细节。
+* 集成 **SEN2SR 频率域约束**，通过 3D FFT 强制模型保留低频数值准确性，并有效缓解 1km 格子边缘的“棋盘效应”。
 
 
-* **混合损失函数 (Hybrid Loss)**:
-* 组合了 `Pixel Loss` (加权), `SSIM Loss`, `Edge Loss`, `Consistency Loss` (物理守恒) 和 `TV Loss` (平滑去噪)。
-* 引入 **Weighted Mask** 机制，重点关注高碳排放区域，解决样本不平衡导致的“全零崩塌”问题。
+* **硬件适配与稳定性 (AMD ROCm Optimized)**:
+* 针对 **AMD Radeon RX 9060 XT** 显存管理进行专项优化。
+* **NaN 免疫机制**: 通过梯度裁剪与显存碎块化回收，解决了在大 Batch 下的数值溢出问题。
 
 
 
@@ -38,9 +43,9 @@ Carbon_SR_Project/
 ├── data/               # 数据集处理模块
 │   └── dataset.py      # DualStreamDataset 定义 (含 Log 归一化/滑窗逻辑)
 ├── models/             # 模型定义
-│   ├── network.py      # DSTCarbonFormer 主模型
+│   ├── network.py      # DSTCarbonFormer 主模型 (v1.5: 引入 Mamba+MoE)
 │   ├── blocks.py       # SFT层, 多尺度块, FFT约束层等
-│   └── losses.py       # HybridLoss 混合损失函数
+│   └── losses.py       # HybridLoss 混合损失函数 (含 TV Loss)
 ├── check_*.py          # 数据自检脚本 (data_stats, granular_stats, everything)
 ├── config.py           # 全局配置文件 (路径、超参数)
 ├── create_split.py     # 数据集划分脚本
@@ -64,10 +69,10 @@ cd Carbon-Emission-Super-Resolution
 ```
 
 
-2. **安装依赖**
-建议使用 Python 3.8+ 和 CUDA 环境。
+2. **激活环境**
+建议使用 Python 3.12+ 及对应的 ROCm PyTorch 环境。
 ```bash
-pip install -r requirements.txt
+source /home/wdc/mamba_env/bin/activate
 
 ```
 
@@ -109,7 +114,7 @@ python create_split.py
 
 ### 1. 系统自检 (可选但推荐)
 
-在开始漫长的训练前，检查显存占用和数据完整性：
+在开始漫长的训练前，检查显存占用（针对 16GB VRAM）和数据完整性：
 
 ```bash
 python check_everything.py
@@ -156,9 +161,9 @@ python inference.py
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `batch_size` | 32 | 根据显存调整 (16G显存推荐 16-32) |
-| `lr` | 1e-4 | 初始学习率 (配合 CosineAnnealingLR) |
-| `resume` | True | 是否开启断点续训 |
+| `batch_size` | **16** | 针对 RX 9060 XT 优化的稳定值，防止 NaN |
+| `lr` | **5e-5** | 初始学习率 (配合 CosineAnnealingLR) |
+| `resume` | `True` | 是否开启断点续训 |
 | `patience` | 15 | 早停机制的耐心值 (Epochs) |
 | `save_freq` | 5 | 每隔多少轮保存一次检查点 |
 
@@ -169,7 +174,7 @@ python inference.py
 模型训练过程会实时监控以下指标：
 
 * **Train/Val Loss**: 混合损失值。
-* **Real MAE (吨)**: 还原到真实物理空间后的平均绝对误差。
+* **Real MAE (吨)**: 还原到真实物理空间后的平均绝对误差（当前 v1.5 成都案例已降至 **0.167**）。
 
 ---
 
@@ -180,4 +185,4 @@ python inference.py
 
 ---
 
-*Last Updated: 2026-01-26*
+*Last Updated: 2026-01-29*
