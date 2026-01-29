@@ -3,13 +3,14 @@ import os
 # ==========================================
 # 🛡️ 1. 核心设置：安全与性能优化
 # ==========================================
+# 开启 GEMM 以获得最佳性能
 os.environ['MIOPEN_DEBUG_CONV_GEMM'] = '1'
+# 禁用 MIOpen 日志
 os.environ['MIOPEN_LOG_LEVEL'] = '2' 
 os.environ['MIOPEN_ENABLE_LOGGING'] = '0'
 os.environ['MIOPEN_USER_DB_PATH'] = './miopen_cache'
 
-# ✅ [修正] AMD 显卡专用的防显存碎片化设置
-# max_split_size_mb:128 是解决 ROCm 显存 OOM 的最佳实践
+# ✅ AMD 显卡防显存碎片化关键设置
 os.environ['PYTORCH_ALLOC_CONF'] = 'max_split_size_mb:128'
 
 import torch
@@ -29,6 +30,39 @@ from config import CONFIG
 
 NORM_FACTOR = 11.0
 
+# ==========================================
+# 📊 [新增] 精细化指标计算函数
+# ==========================================
+def calc_detailed_metrics(pred_real, target_real, threshold=1e-6):
+    """
+    计算三个维度的 MAE：
+    1. Global: 全局平均 (用于早停)
+    2. Non-Zero: 只看高排放区 (城市/工业区)
+    3. Zero: 只看背景 (森林/荒地)
+    """
+    abs_diff = torch.abs(pred_real - target_real)
+    
+    # 1. 全局 MAE
+    global_mae = abs_diff.mean().item()
+    
+    # 2. 生成掩码
+    mask_nonzero = target_real > threshold
+    mask_zero = ~mask_nonzero
+    
+    # 3. Non-Zero MAE (攻坚指标)
+    if mask_nonzero.sum() > 0:
+        nonzero_mae = abs_diff[mask_nonzero].mean().item()
+    else:
+        nonzero_mae = 0.0
+        
+    # 4. Zero MAE (防守指标)
+    if mask_zero.sum() > 0:
+        zero_mae = abs_diff[mask_zero].mean().item()
+    else:
+        zero_mae = 0.0
+        
+    return global_mae, nonzero_mae, zero_mae
+
 def get_latest_checkpoint(save_dir):
     if not os.path.exists(save_dir): return None
     latest_path = os.path.join(save_dir, "latest.pth")
@@ -37,19 +71,16 @@ def get_latest_checkpoint(save_dir):
     return max(files, key=os.path.getmtime) if files else None
 
 def train():
-    # 🕵️ 暂时关闭侦探模式，提高速度 (除非再次报错)
-    # torch.autograd.set_detect_anomaly(True)
-    
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"🔥 使用设备: {device}")
     
     if torch.cuda.is_available():
         print(f"   显卡型号: {torch.cuda.get_device_name(0)}")
+        # 显式关闭 Benchmark 以保证在 ROCm 上的稳定性
         torch.backends.cudnn.benchmark = False 
         torch.backends.cudnn.deterministic = True
     
-    # ✅ [修正] 降低初始 Scale (65536 -> 2048)
-    # 这能极大减少训练初期的 NaN 概率
+    # 初始化 AMP (混合精度)，初始 Scale 设为 2048 防止 NaN
     scaler = torch.amp.GradScaler('cuda', init_scale=2048.0)
     print(f"⚡ 模式: Smart AMP (Init Scale=2048) + AMD Optimized")
 
@@ -70,15 +101,24 @@ def train():
     # ----------------------------------------
     # 3. 模型与优化器
     # ----------------------------------------
-    print("🏗️ 初始化 DSTCarbonFormer 模型 (v1.6)...")
+    print("🏗️ 初始化 DSTCarbonFormer 模型 (v1.6 Mamba+MoE+FFT)...")
     model = DSTCarbonFormer(aux_c=9, main_c=1, dim=64).to(device)
     
-    criterion = HybridLoss(alpha=1.0, beta=0.1, gamma=0.1, delta=0.05, eta=0.1).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=CONFIG['lr'], weight_decay=1e-4)
+    # 初始化自适应混合损失 (不需要传参数了，它自己学)
+    criterion = HybridLoss().to(device)
+    
+    # 🔥 关键修改：将 Loss 的可学习参数也加入优化器
+    optimizer = optim.AdamW(
+        list(model.parameters()) + list(criterion.parameters()), # 同时优化网络和权重
+        lr=CONFIG['lr'], 
+        weight_decay=1e-4
+    )
+    
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CONFIG['epochs'], eta_min=1e-6)
     
     start_epoch = 1
-    best_loss = float('inf')
+    # 🔥 [修改] 不再记录 best_loss，而是记录 best_mae
+    best_mae = float('inf') 
     early_stop_counter = 0 
     
     if CONFIG['resume']:
@@ -91,18 +131,21 @@ def train():
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
                 start_epoch = checkpoint['epoch'] + 1
-                best_loss = checkpoint.get('best_loss', float('inf'))
+                
+                # 兼容旧版 checkpoint
+                best_mae = checkpoint.get('best_mae', float('inf')) 
                 early_stop_counter = checkpoint.get('early_stop_counter', 0)
+                
                 if 'scaler_state_dict' in checkpoint:
                     scaler.load_state_dict(checkpoint['scaler_state_dict'])
-                print(f"✅ 恢复成功! 从 Epoch {start_epoch} 继续")
+                print(f"✅ 恢复成功! 从 Epoch {start_epoch} 继续 (当前最佳MAE: {best_mae:.4f})")
             except Exception as e:
                 print(f"⚠️ 恢复失败 ({e})，将从头开始训练。")
 
     # ----------------------------------------
     # 4. 训练主循环
     # ----------------------------------------
-    print(f"\n🚀 开始训练 | 总轮数: {CONFIG['epochs']}")
+    print(f"\n🚀 开始训练 (v1.7 Auto-Weighting) | 目标: MAE-based Optimization")
     total_start = time.time()
     
     for epoch in range(start_epoch, CONFIG['epochs']+1):
@@ -117,33 +160,26 @@ def train():
             
             optimizer.zero_grad()
             
-            # ✅ 开启 AMP
             with torch.amp.autocast('cuda'):
                 pred = model(aux, main)
-                # 强制 Loss 走 FP32
+                # Loss 自动加权
                 loss = criterion(pred.float(), target.float(), input_main=main.float())
             
-            # ✅ [修正] 健壮的 NaN 处理逻辑
-            # 如果 Loss 是 NaN/Inf，直接跳过，千万不要 update scaler
+            # NaN 熔断机制
             if torch.isnan(loss) or torch.isinf(loss):
                 print(f"⚠️ 警告: Epoch {epoch} 出现 NaN/Inf Loss，跳过此 Batch")
                 optimizer.zero_grad()
-                # 🔴 关键点：这里绝不能调用 scaler.update()，否则会报错 "No inf checks..."
                 continue
 
-            # 正常反向传播
             scaler.scale(loss).backward()
-            
-            # 先 unscale 再裁剪梯度
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
-            # 更新参数
             scaler.step(optimizer)
             scaler.update()
             
             train_loss += loss.item()
             
+            # 训练进度条只看个大概的 MAE
             with torch.no_grad():
                 pred_real = torch.expm1(pred.float().detach() * NORM_FACTOR).clamp(min=0)
                 target_real = torch.expm1(target.float() * NORM_FACTOR).clamp(min=0)
@@ -153,10 +189,14 @@ def train():
             
         avg_train_loss = train_loss / len(train_dl) if len(train_dl) > 0 else 0
         
-        # --- 验证阶段 ---
+        # --- 验证阶段 (精细化监控) ---
         model.eval()
         val_loss = 0
-        total_real_mae = 0 
+        
+        # 三大指标累加器
+        total_global_mae = 0
+        total_nonzero_mae = 0
+        total_zero_mae = 0
         
         with torch.no_grad():
             for aux, main, target in val_dl:
@@ -168,46 +208,66 @@ def train():
                     
                     pred_real = torch.expm1(pred.float() * NORM_FACTOR).clamp(min=0)
                     target_real = torch.expm1(target.float() * NORM_FACTOR).clamp(min=0)
-                    total_real_mae += torch.abs(pred_real - target_real).mean().item()
+                    
+                    # 🔥 调用精细化计算函数
+                    g_mae, nz_mae, z_mae = calc_detailed_metrics(pred_real, target_real)
+                    
+                    total_global_mae += g_mae
+                    total_nonzero_mae += nz_mae
+                    total_zero_mae += z_mae
         
+        # 计算平均值
         avg_val_loss = val_loss / len(val_dl)
-        avg_real_mae = total_real_mae / len(val_dl)
+        avg_global_mae = total_global_mae / len(val_dl)
+        avg_nonzero_mae = total_nonzero_mae / len(val_dl)
+        avg_zero_mae = total_zero_mae / len(val_dl)
         
-        print(f"   📊 Summary: Train={avg_train_loss:.4f} | Val={avg_val_loss:.4f} | MAE={avg_real_mae:.3f} | LR={optimizer.param_groups[0]['lr']:.2e}")
+        # 📝 打印详细战报 (监控权重变化)
+        # 获取当前学习到的权重参数 (转回正常的 sigma 值以便观察)
+        w_pix = torch.exp(-criterion.log_vars[0]).item()
+        w_ssim = torch.exp(-criterion.log_vars[1]).item()
+        w_tv = torch.exp(-criterion.log_vars[2]).item()
         
-        # 保存
+        print(f"   📊 [Val] Loss={avg_val_loss:.4f} | 🌍Global={avg_global_mae:.3f} | 🏙️City={avg_nonzero_mae:.3f} | 🌲Bg={avg_zero_mae:.3f}")
+        print(f"   ⚖️ [Weights] Pixel: {w_pix:.2f} | SSIM: {w_ssim:.2f} | TV: {w_tv:.2f}")
+        
+        # 保存 Latest
         checkpoint_dict = {
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
+            # 记得保存 criterion 的状态 (也就是学习到的权重)
+            'criterion_state_dict': criterion.state_dict(), 
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'scaler_state_dict': scaler.state_dict(),
-            'best_loss': best_loss,
+            'best_mae': best_mae,
             'early_stop_counter': early_stop_counter
         }
-        
         torch.save(checkpoint_dict, os.path.join(CONFIG['save_dir'], "latest.pth"))
 
-        if avg_val_loss < best_loss:
-            best_loss = avg_val_loss
+        # 🔥 核心修改：基于 Global MAE 的早停
+        if avg_global_mae < best_mae:
+            best_mae = avg_global_mae
             early_stop_counter = 0
+            
             torch.save(model.state_dict(), os.path.join(CONFIG['save_dir'], "best_model.pth"))
             torch.save(checkpoint_dict, os.path.join(CONFIG['save_dir'], "best_checkpoint.pth"))
-            print(f"   🏆 最佳模型已更新!")
+            
+            print(f"   🏆 最佳模型已更新! (New Best MAE: {best_mae:.3f})")
         else:
             early_stop_counter += 1
-            print(f"   ⏳ Loss 未下降 ({early_stop_counter}/{CONFIG['patience']})")
+            print(f"   ⏳ MAE 未改善 ({early_stop_counter}/{CONFIG['patience']}) | 最佳: {best_mae:.3f}")
         
         if epoch % CONFIG['save_freq'] == 0:
             torch.save(checkpoint_dict, os.path.join(CONFIG['save_dir'], f"epoch_{epoch}.pth"))
             
         if early_stop_counter >= CONFIG['patience']:
-            print(f"\n🛑 早停。")
+            print(f"\n🛑 早停触发 (Patience={CONFIG['patience']})。")
             break
             
         scheduler.step()
 
-    print(f"\n🏁 训练全部完成！总耗时: {(time.time()-total_start)/60:.2f} 分钟")
+    print(f"\n🏁 训练结束！总耗时: {(time.time()-total_start)/60:.2f} 分钟")
 
 if __name__ == "__main__":
     try:
