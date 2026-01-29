@@ -8,6 +8,10 @@
 
 ## ✨ 核心特性
 
+* **📊 全自动实验记录 (Paper-Ready Logging) [New]**:
+    * **CSV 自动归档**: 训练过程中自动生成 `training_log.csv`，记录每个 Epoch 的 **Loss、学习率 (LR)、五维 MAE 指标**以及 **自适应权重 (W_Pixel, W_SSIM, W_TV)** 的变化曲线。
+    * **数据可视化友好**: 生成的数据格式可直接导入 Excel/Python 绘制论文所需的折线图，支持断点续训自动追加 (Append Mode)，防止数据丢失。
+    
 * **双流架构 (Dual-Stream) & SFT 融合**:
     * **辅助流 (Aux Stream)**: 处理高分辨率多源辅助数据 (9通道: NTL, Road, Water, NDVI, etc.)。
     * **主流 (Main Stream)**: 处理低分辨率碳排放数据。

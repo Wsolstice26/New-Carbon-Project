@@ -11,7 +11,7 @@ CONFIG = {
     "lr": 5e-5,
     
     "epochs": 100,
-    "resume": True,    
+    "resume": False,    
     "patience": 15,
     "num_workers": 8,
     "save_freq": 5,
