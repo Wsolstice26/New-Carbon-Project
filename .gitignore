@@ -1,26 +1,13 @@
-# 1. 忽略所有 Python 缓存
+# .gitignore
 __pycache__/
 *.pyc
-
-# 2. 忽略巨大的数据文件
-*.npy
-*.npz
-data/Train_Data_Yearly_Coords/
-data/*.zip
-data/*.tar.gz
-
-# 3. 忽略模型检查点 (Checkpoints)
-# 这些通常很大，建议只上传最好的那个到 Releases，或者用网盘分享
-*.pth
-Checkpoints/
-weights/
-miopen_cache/
-
-# 4. 忽略系统文件
 .DS_Store
-.vscode/
-.idea/
 
-# 5. 忽略日志和图表 (可选，如果你想保留图表可以注释掉)
+# 忽略数据集和输出
+data/
+Checkpoints/
+results/
 logs/
-*.log
+
+# 忽略 MIOpen 缓存 (因为它是特定于机器硬件的)
+.cache/
