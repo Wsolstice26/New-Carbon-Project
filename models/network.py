@@ -1,14 +1,11 @@
-# models/network.py
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ✅ 修改1: 移除从 blocks 导入 FrequencyHardConstraint，改为在本地定义以确保逻辑准确
-# 保留其他模块的导入
+# 从 blocks 导入已优化的模块
 from .blocks import MultiScaleBlock3D, SFTLayer3D, EfficientContextBlock, MoEBlock
 
-# ✅ 修改2: 鲁棒性导入 Mamba
+# 鲁棒性导入 Mamba
 try:
     from mamba_ssm import Mamba
 except ImportError:
@@ -16,65 +13,78 @@ except ImportError:
     Mamba = None
 
 # ==========================================
-# 🔥 新增: 本地定义的物理硬约束层
+# 🛠️ 辅助类: 深度可分离卷积 (性能救星)
+# ==========================================
+class DepthwiseSeparableConv3d(nn.Module):
+    """
+    将标准 Conv3d 拆分为 Depthwise + Pointwise，
+    解决 AMD ROCm 上标准 3D 卷积反向传播极慢 (1.7s -> 0.1s) 的问题。
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
+        super().__init__()
+        self.depthwise = nn.Conv3d(
+            in_channels, in_channels, kernel_size, stride, padding, 
+            groups=in_channels # 关键：分组数=通道数
+        )
+        self.pointwise = nn.Conv3d(in_channels, out_channels, 1, 1, 0)
+
+    def forward(self, x):
+        x = self.depthwise(x)
+        x = self.pointwise(x)
+        return x
+
+# ==========================================
+# 🛡️ 物理硬约束层 (AMP 安全版)
 # ==========================================
 class FrequencyHardConstraint(nn.Module):
-    """
-    物理硬约束层 (Physical Hard Constraint):
-    强制 Prediction 的低频部分 (Low Frequency) 严格等于 Input 的低频部分。
-    
-    原理：
-    Input 是 4km 的马赛克数据 (由 1km 降采样而来)，它丢失了高频细节，
-    但在低频（宏观总量）上是物理守恒的。
-    因此，我们强制 Output 在低频段与 Input 保持一致，只允许模型生成高频细节。
-    """
     def __init__(self, radius=16):
         super().__init__()
         self.radius = radius
 
     def forward(self, pred, low_res_input):
-        # 1. FFT 变换到频域 (Batch, C, T, H, W) -> (Batch, C, T, H, W) 复数
-        pred_fft = torch.fft.fft2(pred)
-        input_fft = torch.fft.fft2(low_res_input)
-        
-        # 2. 创建低频掩码 (Low Pass Mask)
-        B, C, T, H, W = pred.shape
-        cy, cx = H // 2, W // 2
-        
-        # 生成网格坐标
-        y = torch.arange(H).to(pred.device)
-        x = torch.arange(W).to(pred.device)
-        y_grid, x_grid = torch.meshgrid(y, x, indexing="ij")
-        
-        # 计算到中心的距离 (频谱搬移后中心是低频)
-        # 注意：这里我们假设 H, W 是空间维度
-        dist = torch.sqrt((y_grid - cy)**2 + (x_grid - cx)**2)
-        
-        # 生成 Mask (1 表示低频区域，0 表示高频区域)
-        mask = (dist <= self.radius).float().view(1, 1, 1, H, W)
-        
-        # 3. 频谱搬移 (Shift) 让低频来到中心
-        pred_fft_shifted = torch.fft.fftshift(pred_fft, dim=(-2, -1))
-        input_fft_shifted = torch.fft.fftshift(input_fft, dim=(-2, -1))
-        
-        # 4. 🔥 核心操作: 替换低频
-        # 用 Input 的低频 + Pred 的高频
-        combined_fft_shifted = input_fft_shifted * mask + pred_fft_shifted * (1 - mask)
-        
-        # 5. 逆变换回空域
-        combined_fft = torch.fft.ifftshift(combined_fft_shifted, dim=(-2, -1))
-        output = torch.fft.ifft2(combined_fft).real
-        
-        return output
+        # 🔥 关键修复: 关闭 AMP，强制 FP32
+        # FFT 在 FP16 下极易溢出导致 NaN，必须保护
+        with torch.amp.autocast('cuda', enabled=False):
+            pred = pred.float()
+            low_res_input = low_res_input.float()
+            
+            # 1. FFT 变换
+            pred_fft = torch.fft.fft2(pred)
+            input_fft = torch.fft.fft2(low_res_input)
+            
+            # 2. 创建 Mask (Lazy Creation to save memory)
+            B, C, T, H, W = pred.shape
+            cy, cx = H // 2, W // 2
+            y = torch.arange(H, device=pred.device)
+            x = torch.arange(W, device=pred.device)
+            y_grid, x_grid = torch.meshgrid(y, x, indexing="ij")
+            dist = torch.sqrt((y_grid - cy)**2 + (x_grid - cx)**2)
+            mask = (dist <= self.radius).float().view(1, 1, 1, H, W)
+            
+            # 3. 频谱搬移与替换
+            pred_fft_shifted = torch.fft.fftshift(pred_fft, dim=(-2, -1))
+            input_fft_shifted = torch.fft.fftshift(input_fft, dim=(-2, -1))
+            
+            # 这里的逻辑是：低频取 input (物理守恒)，高频取 pred (细节生成)
+            combined_fft_shifted = input_fft_shifted * mask + pred_fft_shifted * (1 - mask)
+            
+            # 4. 逆变换
+            combined_fft = torch.fft.ifftshift(combined_fft_shifted, dim=(-2, -1))
+            output = torch.fft.ifft2(combined_fft).real
+            
+            return output
 
-# 保持 ConvBlock3D 不变
+# ==========================================
+# 🧱 基础卷积块 (已替换为高效卷积)
+# ==========================================
 class ConvBlock3D(nn.Module):
     def __init__(self, in_c, out_c):
         super().__init__()
+        # 替换原有的 nn.Conv3d 为 DepthwiseSeparableConv3d
         self.conv = nn.Sequential(
-            nn.Conv3d(in_c, out_c, 3, 1, 1),
+            DepthwiseSeparableConv3d(in_c, out_c, 3, 1, 1),
             nn.PReLU(),
-            nn.Conv3d(out_c, out_c, 3, 1, 1)
+            DepthwiseSeparableConv3d(out_c, out_c, 3, 1, 1)
         )
     def forward(self, x): return self.conv(x)
 
@@ -85,12 +95,12 @@ class DSTCarbonFormer(nn.Module):
     def __init__(self, aux_c=9, main_c=1, dim=64):
         super().__init__()
         
-        # 1. 辅助流编码器
-        self.aux_head = nn.Conv3d(aux_c, dim, 3, 1, 1)
+        # 1. 辅助流编码器 (Head 也换成高效卷积)
+        self.aux_head = DepthwiseSeparableConv3d(aux_c, dim, 3, 1, 1)
         self.aux_multiscale = MultiScaleBlock3D(dim) 
         
         # 2. 主流编码器
-        self.main_head = nn.Conv3d(main_c, dim, 3, 1, 1)
+        self.main_head = DepthwiseSeparableConv3d(main_c, dim, 3, 1, 1)
         
         # 3. 双流融合 (SFT Fusion)
         # Stage 1: 标准 SFT + ResBlock
@@ -104,7 +114,11 @@ class DSTCarbonFormer(nn.Module):
         # 4. 全局上下文 (Mamba)
         self.global_context = EfficientContextBlock(dim)
         
-        # Mamba 初始化
+        # 🔥 Mamba 优化: 降采样比例 (Lightweight Strategy)
+        self.down_scale = 4 
+        # 降采样层 (120 -> 30)
+        self.mamba_down = nn.AvgPool3d((1, self.down_scale, self.down_scale))
+        
         if Mamba is not None:
             self.mamba_block = Mamba(
                 d_model=dim, 
@@ -115,16 +129,26 @@ class DSTCarbonFormer(nn.Module):
         else:
             self.mamba_block = nn.Identity()
         
-        # 5. 重建层
+        # 5. 重建层 (Tail)
         self.tail = nn.Sequential(
-            nn.Conv3d(dim, dim, 3, 1, 1),
+            DepthwiseSeparableConv3d(dim, dim, 3, 1, 1),
             nn.PReLU(),
-            nn.Conv3d(dim, 1, 3, 1, 1)
+            DepthwiseSeparableConv3d(dim, 1, 3, 1, 1)
         )
         
         # 6. 频率硬约束
-        # ✅ 修改3: 将 radius 设为 16，适配 160x160 的尺寸
         self.constraint = FrequencyHardConstraint(radius=16)
+
+    # 将 Mamba 逻辑剥离并禁止编译，防止 Dynamo 报错
+    @torch.compiler.disable
+    def _forward_mamba_safe(self, x):
+        """
+        x: [B, C, T, H_small, W_small]
+        """
+        B, C, T, H, W = x.shape
+        x_flat = x.flatten(2).transpose(1, 2) # (B, L, C)
+        x_out = self.mamba_block(x_flat)
+        return x_out.transpose(1, 2).view(B, C, T, H, W)
 
     def forward(self, aux, main):
         # Feature Extraction
@@ -141,21 +165,28 @@ class DSTCarbonFormer(nn.Module):
         f_main = self.sft2(f_main, f_aux)
         f_main = self.moe_block(f_main)
         
-        # Global Context
+        # Global Context (Channel Attention)
         f_global = self.global_context(f_main)
         
-        # ✅ 数据形状适配 Mamba
-        B, C, T, H, W = f_global.shape
+        # ===========================
+        # 🔥 Mamba 轻量化路径
+        # ===========================
+        # 1. 降采样 (B, C, T, 120, 120) -> (B, C, T, 30, 30)
+        # 这一步让计算量减少 16 倍！
+        f_small = self.mamba_down(f_global)
         
-        # (B, C, T, H, W) -> (B, L, C)
-        x_mamba = f_global.flatten(2).transpose(1, 2)
+        # 2. 运行 Mamba (Eager Mode, Safe)
+        f_mamba_small = self._forward_mamba_safe(f_small)
         
-        # Mamba Forward
-        x_mamba = self.mamba_block(x_mamba)
+        # 3. 上采样回原尺寸 (使用三线性插值)
+        f_mamba = F.interpolate(
+            f_mamba_small, 
+            size=f_global.shape[2:], # (T, H, W)
+            mode='trilinear', 
+            align_corners=False
+        )
         
-        # 还原: (B, L, C) -> (B, C, T, H, W)
-        f_mamba = x_mamba.transpose(1, 2).view(B, C, T, H, W)
-        
+        # 残差连接
         f_final = f_main + f_mamba
         
         # Reconstruction
@@ -164,8 +195,7 @@ class DSTCarbonFormer(nn.Module):
         # 初始预测
         pred_raw = F.relu(main + residual)
         
-        # ✅ 最后一步: 物理硬约束
-        # 强制把 pred_raw 的低频部分替换为 main (马赛克输入) 的低频部分
+        # 物理硬约束
         final_output = self.constraint(pred_raw, main)
         
         return final_output

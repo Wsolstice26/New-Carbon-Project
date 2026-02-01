@@ -1,26 +1,5 @@
 import os
-
-# ==========================================
-# 🚀 [环境补丁] AMD ROCm 缓存与优化
-# ==========================================
-# 1. 设置持久化缓存目录 (加速二次启动)
-cache_dir = os.path.expanduser("~/.cache/miopen")
-os.makedirs(cache_dir, exist_ok=True)
-os.environ['MIOPEN_USER_DB_PATH'] = cache_dir
-os.environ['MIOPEN_CUSTOM_CACHE_DIR'] = cache_dir
-
-# 2. 强制开启 Workspace (防止显存警告)
-os.environ['MIOPEN_FORCE_USE_WORKSPACE'] = '1'
-
-# 3. 日志与线程优化
-os.environ['MIOPEN_LOG_LEVEL'] = '4'
-os.environ['MIOPEN_DEBUG_CONV_GEMM'] = '0'
-os.environ['MKL_THREADING_LAYER'] = 'GNU'
-
-# ❌ [已移除] 显存锁
-# 刚才的测试证明这行代码会导致显存分配失败(OOM)，让 PyTorch 自动管理更安全
-# os.environ['PYTORCH_ALLOC_CONF'] = 'max_split_size_mb:128'
-
+import warnings
 import csv
 import torch
 import torch.nn as nn
@@ -30,29 +9,43 @@ from tqdm import tqdm
 import glob
 import numpy as np
 
-# 导入项目模块
+# ==========================================
+# 🔇 [日志静音]
+# ==========================================
+warnings.filterwarnings("ignore", message=".*Dynamo does not know how to trace the builtin.*")
+warnings.filterwarnings("ignore", message=".*Unable to hit fast path of CUDAGraphs.*")
+warnings.filterwarnings("ignore", message=".*TensorFloat32 tensor cores.*")
+
+# ==========================================
+# 🚀 [环境补丁]
+# ==========================================
+cache_dir = os.path.expanduser("~/.cache/miopen")
+os.makedirs(cache_dir, exist_ok=True)
+os.environ['MIOPEN_USER_DB_PATH'] = cache_dir
+os.environ['MIOPEN_CUSTOM_CACHE_DIR'] = cache_dir
+os.environ['MIOPEN_FORCE_USE_WORKSPACE'] = '1'
+os.environ['MIOPEN_LOG_LEVEL'] = '4'
+os.environ['MIOPEN_DEBUG_CONV_GEMM'] = '0'
+os.environ['MKL_THREADING_LAYER'] = 'GNU'
+os.environ['MKL_SERVICE_FORCE_INTEL'] = '1'
+
+torch.set_float32_matmul_precision('high')
+torch.backends.cudnn.benchmark = True
+
 from data.dataset import DualStreamDataset
 from models.network import DSTCarbonFormer
 from models.losses import HybridLoss 
 from config import CONFIG 
 
-# 开启 cudnn/miopen 自动寻优
-torch.backends.cudnn.benchmark = True
-
 def calc_detailed_metrics(pred_real, target_real, threshold=1e-6):
-    """计算详细评估指标"""
     abs_diff = torch.abs(pred_real - target_real)
     global_mae = abs_diff.mean().item()
-    
     mask_nonzero = target_real > threshold
     mask_zero = ~mask_nonzero
-    
     nonzero_mae = abs_diff[mask_nonzero].mean().item() if mask_nonzero.sum() > 0 else 0.0
     zero_mae = abs_diff[mask_zero].mean().item() if mask_zero.sum() > 0 else 0.0
-    
     mask_top1 = target_real > 1830
     top1_mae = abs_diff[mask_top1].mean().item() if mask_top1.sum() > 0 else 0.0
-    
     balanced_mae = 0.5 * nonzero_mae + 0.5 * zero_mae
     return global_mae, nonzero_mae, zero_mae, balanced_mae, top1_mae
 
@@ -66,34 +59,30 @@ def get_latest_checkpoint(save_dir):
 
 def train():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"🔥 设备: {device} | 模式: 120x120 Final (Loss Scaled x100)")
+    print(f"🔥 设备: {device} | 模式: 120x120 Final (Softmax Weighted)")
     print(f"📂 数据集: {CONFIG['data_dir']}")
     print(f"📏 Dim: {CONFIG.get('dim', 48)} | Batch: {CONFIG['batch_size']}")
     
     scaler = torch.amp.GradScaler('cuda', init_scale=65535.0)
     os.makedirs(CONFIG['save_dir'], exist_ok=True)
     
-    # 初始化日志
     log_file = os.path.join(CONFIG['save_dir'], 'training_log.csv')
     if not os.path.exists(log_file):
         with open(log_file, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(['Epoch', 'LR', 'Train_Loss', 'Val_Loss', 
                              'MAE_Global', 'MAE_Balanced', 'MAE_Ext', 
-                             'W_Pixel', 'W_SSIM', 'W_TV', 'W_Cons'])
+                             'W_CV', 'W_SSIM', 'W_TV', 'W_Cons'])
 
     # --- 加载数据 ---
     print(f"📦 加载数据 (Workers={CONFIG['num_workers']})...")
     train_ds = DualStreamDataset(CONFIG['data_dir'], CONFIG['split_config'], 'train', time_window=CONFIG['time_window'])
     val_ds = DualStreamDataset(CONFIG['data_dir'], CONFIG['split_config'], 'val', time_window=CONFIG['time_window'])
     
-    # 动态设置 persistent_workers
     use_persistent = (CONFIG['num_workers'] > 0)
-    
     train_dl = DataLoader(train_ds, batch_size=CONFIG['batch_size'], shuffle=True, 
                           num_workers=CONFIG['num_workers'], pin_memory=True, 
                           persistent_workers=use_persistent)
-                          
     val_dl = DataLoader(val_ds, batch_size=CONFIG['batch_size'], shuffle=False, 
                         num_workers=CONFIG['num_workers'], pin_memory=True, 
                         persistent_workers=use_persistent)
@@ -117,11 +106,19 @@ def train():
         if latest_ckpt:
             print(f"🔄 恢复检查点: {latest_ckpt}")
             try:
-                checkpoint = torch.load(latest_ckpt, map_location=device)
+                # 🔥🔥🔥【修复点】在这里加上 weights_only=False 🔥🔥🔥
+                # 告诉 PyTorch：这个文件是我生成的，是安全的，请加载全部数据
+                checkpoint = torch.load(latest_ckpt, map_location=device, weights_only=False)
+                
                 model.load_state_dict(checkpoint['model_state_dict'])
+                
+                # 尝试加载 Loss 状态
                 if 'criterion_state_dict' in checkpoint:
-                     try: criterion.load_state_dict(checkpoint['criterion_state_dict'])
-                     except: print("⚠️ Loss权重不匹配，已重置")
+                     try: 
+                         criterion.load_state_dict(checkpoint['criterion_state_dict'])
+                     except: 
+                         print("⚠️ Loss权重结构不匹配，已重置")
+                
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
                 scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
                 if 'scaler_state_dict' in checkpoint:
@@ -140,14 +137,15 @@ def train():
         loop = tqdm(train_dl, desc=f"Ep {epoch}/{CONFIG['epochs']}")
         
         for aux, main, target in loop:
-            aux, main, target = aux.to(device, non_blocking=True), main.to(device, non_blocking=True), target.to(device, non_blocking=True)
+            torch.compiler.cudagraph_mark_step_begin()
             
-            optimizer.zero_grad()
+            aux, main, target = aux.to(device, non_blocking=True), main.to(device, non_blocking=True), target.to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            
             with torch.amp.autocast('cuda'):
                 pred = model(aux, main)
-                # 🔥 [修改] 将 Loss 放大 100 倍
-                # 这样 log 里的 loss 值会变成 0.x 或 1.x，看起来更直观
-                loss = criterion(pred, target, main) * 100.0
+                # 🔥 Loss 恒为正
+                loss = criterion(pred, target, main) * 1000
             
             if torch.isnan(loss): 
                 print("⚠️ Loss is NaN!"); continue
@@ -177,11 +175,11 @@ def train():
         
         with torch.no_grad():
             for aux, main, target in val_dl:
-                aux, main, target = aux.to(device), main.to(device), target.to(device)
+                torch.compiler.cudagraph_mark_step_begin()
+                aux, main, target = aux.to(device, non_blocking=True), main.to(device, non_blocking=True), target.to(device, non_blocking=True)
                 with torch.amp.autocast('cuda'):
                     pred = model(aux, main)
-                    # 🔥 [修改] 验证集 Loss 也要记得放大，保持一致
-                    val_loss += (criterion(pred, target, main) * 100.0).item()
+                    val_loss += (criterion(pred, target, main)* 1000.0).item()
                     
                     pred_real = torch.expm1(pred.float() * CONFIG['norm_factor']).clamp(min=0)
                     target_real = torch.expm1(target.float() * CONFIG['norm_factor']).clamp(min=0)
@@ -193,11 +191,16 @@ def train():
         avg_metrics = total_metrics / batch_count if batch_count > 0 else np.zeros(5)
         
         lr = optimizer.param_groups[0]['lr']
-        ws = torch.exp(criterion.w_params)
-        ws = (ws / ws.sum() * 4.0).detach().cpu().numpy()
+        
+        # 🔥🔥🔥【关键修改】🔥🔥🔥
+        # 适配新的 Softmax 权重读取逻辑
+        with torch.no_grad():
+            # w_params -> softmax -> * 4.0
+            ws = torch.softmax(criterion.w_params, dim=0) * 4.0
+            ws = ws.cpu().numpy()
         
         print(f"   📊 Val Loss={avg_val_loss:.4f} | Bal MAE={avg_metrics[3]:.3f}")
-        print(f"   ⚖️ Weights -> Px:{ws[0]:.2f} SSIM:{ws[1]:.2f} TV:{ws[2]:.2f} Cons:{ws[3]:.2f}")
+        print(f"   ⚖️ Weights -> CV:{ws[0]:.2f} SSIM:{ws[1]:.2f} TV:{ws[2]:.2f} Cons:{ws[3]:.2f}")
 
         # --- 保存记录 ---
         with open(log_file, 'a', newline='') as f:
@@ -214,6 +217,7 @@ def train():
             'criterion_state_dict': criterion.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
+            'scaler_state_dict': scaler.state_dict(),
             'best_balanced_mae': best_balanced_mae
         }
         torch.save(ckpt, os.path.join(CONFIG['save_dir'], "latest.pth"))
