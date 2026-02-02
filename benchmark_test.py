@@ -1,362 +1,247 @@
 # -*- coding: utf-8 -*-
 import os
-import gc
 import time
-import warnings
-from typing import Union, Tuple, List, Dict
-
-# ==========================================
-# 🔇 [日志静音]
-# ==========================================
-warnings.filterwarnings("ignore", message=".*Dynamo does not know how to trace the builtin.*")
-warnings.filterwarnings("ignore", message=".*Unable to hit fast path of CUDAGraphs.*")
-warnings.filterwarnings("ignore", message=".*TensorFloat32 tensor cores.*")
-
-# ==========================================
-# 🚀 [环境补丁]
-# ==========================================
-cache_dir = os.path.expanduser("~/.cache/miopen")
-os.makedirs(cache_dir, exist_ok=True)
-os.environ["MIOPEN_USER_DB_PATH"] = cache_dir
-os.environ["MIOPEN_CUSTOM_CACHE_DIR"] = cache_dir
-os.environ["MIOPEN_FORCE_USE_WORKSPACE"] = "1"
-os.environ["MIOPEN_LOG_LEVEL"] = "4"
-os.environ["MIOPEN_DEBUG_CONV_GEMM"] = "0"
-os.environ["MKL_THREADING_LAYER"] = "GNU"
-os.environ["MKL_SERVICE_FORCE_INTEL"] = "1"
-
 import torch
-torch.set_float32_matmul_precision('high')
 import torch.nn as nn
+import torch.nn.functional as F
 
-torch.backends.cudnn.benchmark = True
-torch.backends.cudnn.deterministic = False
+# 你的项目里应该是类似这样导入（按你仓库实际路径调整）
+# from model.network import DSTCarbonFormer
+# from model.losses import HybridLoss
+from models.network import DSTCarbonFormer
+from models.losses import HybridLoss
 
-# ==========================================
-# 导入项目模块
-# ==========================================
-try:
-    from models.blocks import MultiScaleBlock3D, SFTLayer3D, MoEBlock
-    from models.network import DSTCarbonFormer
-    from mamba_ssm import Mamba
-    # 🔥 新增导入 Loss
-    from models.losses import HybridLoss 
-except ImportError as e:
-    print(f"❌ 导入失败: {e}")
-    print("💡 请确保 losses.py 已保存到 models/losses.py，且 blocks.py/network.py 均存在。")
-    raise SystemExit(1)
 
-# ... (MambaAdapter 保持不变) ...
-class MambaAdapter(nn.Module):
-    def __init__(self, dim: int):
-        super().__init__()
-        self.mamba = Mamba(d_model=dim, d_state=16, d_conv=4, expand=2)
+torch.backends.cudnn.benchmark = True  # ROCm 下不一定等价，但保留无妨
 
-    @torch.compiler.disable
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, T, H, W = x.shape
-        x_flat = x.flatten(2).transpose(1, 2)
-        out = self.mamba(x_flat)
-        return out.transpose(1, 2).view(B, C, T, H, W)
 
-# ... (_to_device, _clean 保持不变) ...
-def _to_device(inputs, device):
-    if isinstance(inputs, (tuple, list)):
-        return [x.to(device, non_blocking=True) for x in inputs]
-    return [inputs.to(device, non_blocking=True)]
+def _sync():
+    torch.cuda.synchronize()
 
-def _clean(*objs):
-    for o in objs:
-        try:
-            del o
-        except Exception:
-            pass
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
-# ... (benchmark_forward 保持不变) ...
+def _timeit(fn):
+    _sync()
+    t0 = time.time()
+    fn()
+    _sync()
+    return (time.time() - t0) * 1000.0
+
+
 @torch.no_grad()
-def benchmark_forward(name, module, inputs, iters=50, warmup=5):
-    print("--------------------------------------------------")
+def benchmark_forward_only(module: nn.Module, x, name: str, iters=10, warmup=3):
     print(f"🧪 测试模块 (forward-only): {name}")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    try:
-        module = module.to(device)
-        module.eval()
-        inps = _to_device(inputs, device)
-        
-        # 预热
-        print("   🔥 预热中...")
-        for _ in range(warmup):
-            torch.compiler.cudagraph_mark_step_begin()
-            _ = module(*inps)
-        if torch.cuda.is_available(): torch.cuda.synchronize()
+    print("   🔥 预热中...")
+    for _ in range(warmup):
+        _ = module(x)
+    _sync()
 
-        # 测试
-        start = time.time()
-        for _ in range(iters):
-            torch.compiler.cudagraph_mark_step_begin()
-            _ = module(*inps)
-        if torch.cuda.is_available(): torch.cuda.synchronize()
-
-        avg_ms = (time.time() - start) / iters * 1000.0
-        print(f"   ⏱️ 平均耗时: {avg_ms:.2f} ms / batch")
-        return avg_ms
-    except Exception as e:
-        print(f"   ❌ forward-only 测试失败: {e}")
-        return float("inf")
-    finally:
-        _clean(module, inputs)
-
-# ... (benchmark_trainstep 保持不变，用于单模块测试) ...
-def benchmark_trainstep(name, module, inputs, iters=20, warmup=3, lr=1e-4, use_amp=False):
-    # (此处代码与之前一致，省略以节省篇幅，重点是下面的 full_model 版)
+    total = 0.0
+    for _ in range(iters):
+        total += _timeit(lambda: module(x))
+    avg = total / iters
+    print(f"   ⏱️ 平均耗时: {avg:.2f} ms / batch")
     print("--------------------------------------------------")
+    return avg
+
+
+def benchmark_trainstep(module: nn.Module, x, target, name: str, iters=10, warmup=3, amp=True):
     print(f"🧪 测试模块 (trainstep): {name}")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    try:
-        module = module.to(device)
-        module.train()
-        inps = _to_device(inputs, device)
-        opt = torch.optim.AdamW(module.parameters(), lr=lr)
-        scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+    module.train()
+    opt = torch.optim.Adam(module.parameters(), lr=1e-3)
+    scaler = torch.cuda.amp.GradScaler(enabled=amp)
 
-        for _ in range(warmup):
-            torch.compiler.cudagraph_mark_step_begin()
-            opt.zero_grad(set_to_none=True)
-            with torch.amp.autocast('cuda', enabled=use_amp):
-                out = module(*inps)
-                loss = out.float().mean()
+    # warmup
+    for _ in range(warmup):
+        opt.zero_grad(set_to_none=True)
+        with torch.amp.autocast("cuda", enabled=amp):
+            y = module(x)
+            loss = F.mse_loss(y, target)
+        scaler.scale(loss).backward()
+        scaler.step(opt)
+        scaler.update()
+    _sync()
+
+    fwd_ms = loss_ms = bwd_ms = step_ms = 0.0
+    for _ in range(iters):
+        opt.zero_grad(set_to_none=True)
+
+        # fwd
+        def _fwd():
+            nonlocal y
+            with torch.amp.autocast("cuda", enabled=amp):
+                y = module(x)
+
+        y = None
+        fwd_ms += _timeit(_fwd)
+
+        # loss
+        def _loss():
+            nonlocal loss
+            loss = F.mse_loss(y, target)
+
+        loss = None
+        loss_ms += _timeit(_loss)
+
+        # bwd
+        def _bwd():
             scaler.scale(loss).backward()
+
+        bwd_ms += _timeit(_bwd)
+
+        # step
+        def _step():
             scaler.step(opt)
             scaler.update()
-        if torch.cuda.is_available(): torch.cuda.synchronize()
 
-        fwd_t = loss_t = bwd_t = step_t = 0.0
-        for _ in range(iters):
-            torch.compiler.cudagraph_mark_step_begin()
-            opt.zero_grad(set_to_none=True)
-            
-            t0 = time.time()
-            with torch.amp.autocast('cuda', enabled=use_amp):
-                out = module(*inps)
-            if torch.cuda.is_available(): torch.cuda.synchronize()
-            t1 = time.time()
-            
-            loss = out.float().mean()
-            if torch.cuda.is_available(): torch.cuda.synchronize()
-            t2 = time.time()
-            
-            scaler.scale(loss).backward()
-            if torch.cuda.is_available(): torch.cuda.synchronize()
-            t3 = time.time()
-            
-            scaler.step(opt)
-            scaler.update()
-            if torch.cuda.is_available(): torch.cuda.synchronize()
-            t4 = time.time()
-            
-            fwd_t += (t1 - t0); loss_t += (t2 - t1); bwd_t += (t3 - t2); step_t += (t4 - t3)
+        step_ms += _timeit(_step)
 
-        n = iters
-        fwd_ms, loss_ms = fwd_t/n*1000, loss_t/n*1000
-        bwd_ms, step_ms = bwd_t/n*1000, step_t/n*1000
-        total_ms = fwd_ms + loss_ms + bwd_ms + step_ms
-        print(f"   ⏱️ fwd : {fwd_ms:.2f} ms")
-        print(f"   ⏱️ loss: {loss_ms:.2f} ms")
-        print(f"   ⏱️ bwd : {bwd_ms:.2f} ms")
-        print(f"   ⏱️ step: {step_ms:.2f} ms")
-        print(f"   ✅ total: {total_ms:.2f} ms / iter")
-        return {"total_ms": total_ms, "fwd_ms": fwd_ms, "bwd_ms": bwd_ms}
-    except Exception as e:
-        print(f"   ❌ trainstep 测试失败: {e}")
-        return {"total_ms": float("inf")}
-    finally:
-        _clean(module, inputs)
+    fwd_ms /= iters
+    loss_ms /= iters
+    bwd_ms /= iters
+    step_ms /= iters
+    total_ms = fwd_ms + loss_ms + bwd_ms + step_ms
 
-# ==========================================
-# 🔥 [新增] 全模型 + Loss 专用测试函数
-# ==========================================
+    print(f"   ⏱️ fwd : {fwd_ms:.2f} ms")
+    print(f"   ⏱️ loss: {loss_ms:.2f} ms")
+    print(f"   ⏱️ bwd : {bwd_ms:.2f} ms")
+    print(f"   ⏱️ step: {step_ms:.2f} ms")
+    print(f"   ✅ total: {total_ms:.2f} ms / iter")
+    print("--------------------------------------------------")
+    return total_ms
+
+
 def benchmark_full_model_trainstep(
-    name: str,
     model: nn.Module,
     criterion: nn.Module,
-    aux_input: torch.Tensor,
-    main_input: torch.Tensor,
-    target: torch.Tensor,
-    iters: int = 20,
-    warmup: int = 3,
-    lr: float = 1e-4,
-    use_amp: bool = True # 默认开启混合精度
+    aux, main, target,
+    name: str,
+    constraint_scale,
+    iters=5,
+    warmup=1,
+    amp=True,
 ):
-    print("--------------------------------------------------")
     print(f"🧪 全流程测试 (Full Model + Loss): {name}")
+    print(f"   ⚙️ constraint_scale={constraint_scale} | amp={amp}")
+    model.train()
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    scaler = torch.amp.GradScaler("cuda", enabled=amp)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    try:
-        model = model.to(device)
-        criterion = criterion.to(device)
-        model.train()
-        
-        # 准备数据
-        aux = aux_input.to(device, non_blocking=True)
-        main = main_input.to(device, non_blocking=True)
-        tgt = target.to(device, non_blocking=True)
+    print("   🔥 预热中 (含反传)...")
+    for _ in range(warmup):
+        opt.zero_grad(set_to_none=True)
+        with torch.amp.autocast("cuda", enabled=amp):
+            pred, pred_raw = model(aux, main, constraint_scale=constraint_scale)
+            loss = criterion(pred, target, aux, pred_raw=pred_raw)
+        scaler.scale(loss).backward()
+        scaler.step(opt)
+        scaler.update()
+    _sync()
 
-        opt = torch.optim.AdamW(model.parameters(), lr=lr)
-        scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+    total_ms = 0.0
+    for _ in range(iters):
+        opt.zero_grad(set_to_none=True)
 
-        print("   🔥 预热中 (含反传)...")
-        for _ in range(warmup):
-            torch.compiler.cudagraph_mark_step_begin()
-            opt.zero_grad(set_to_none=True)
-            with torch.amp.autocast('cuda', enabled=use_amp):
-                # 1. Forward
-                pred = model(aux, main)
-                # 2. Loss (传入 main 作为 input_mosaic_low_res)
-                loss = criterion(pred, tgt, input_mosaic_low_res=main)
-            # 3. Backward
-            scaler.scale(loss).backward()
+        # model fwd
+        def _mfwd():
+            nonlocal pred, pred_raw
+            with torch.amp.autocast("cuda", enabled=amp):
+                pred, pred_raw = model(aux, main, constraint_scale=constraint_scale)
+
+        pred = pred_raw = None
+        t_fwd = _timeit(_mfwd)
+
+        # loss
+        def _l():
+            nonlocal loss
+            loss = criterion(pred, target, aux, pred_raw=pred_raw)
+
+        loss = None
+        t_loss = _timeit(_l)
+
+        # backward
+        t_bwd = _timeit(lambda: scaler.scale(loss).backward())
+
+        # step
+        def _st():
             scaler.step(opt)
             scaler.update()
-        if torch.cuda.is_available(): torch.cuda.synchronize()
 
-        fwd_t = loss_t = bwd_t = step_t = 0.0
+        t_step = _timeit(_st)
 
-        for _ in range(iters):
-            torch.compiler.cudagraph_mark_step_begin()
-            opt.zero_grad(set_to_none=True)
+        t_total = t_fwd + t_loss + t_bwd + t_step
+        total_ms += t_total
 
-            # --- Forward ---
-            t0 = time.time()
-            with torch.amp.autocast('cuda', enabled=use_amp):
-                pred = model(aux, main)
-            if torch.cuda.is_available(): torch.cuda.synchronize()
-            t1 = time.time()
+        print(f"   ⏱️ Model Fwd : {t_fwd:.2f} ms")
+        print(f"   ⏱️ Loss Calc : {t_loss:.2f} ms")
+        print(f"   ⏱️ Backward  : {t_bwd:.2f} ms")
+        print(f"   ⏱️ Opt Step  : {t_step:.2f} ms")
+        print(f"   ✅ Total Time: {t_total:.2f} ms / iter")
 
-            # --- Loss ---
-            with torch.amp.autocast('cuda', enabled=use_amp):
-                # HybridLoss 需要 (pred, target, low_res_input)
-                loss = criterion(pred, tgt, input_mosaic_low_res=main)
-            if torch.cuda.is_available(): torch.cuda.synchronize()
-            t2 = time.time()
+        if hasattr(criterion, "log_vars"):
+            w = torch.exp(-criterion.log_vars.detach()).cpu().numpy()
+            print(f"   ⚖️ weights(exp(-log_vars)) = {w}")
 
-            # --- Backward ---
-            scaler.scale(loss).backward()
-            if torch.cuda.is_available(): torch.cuda.synchronize()
-            t3 = time.time()
+    avg = total_ms / iters
+    return avg
 
-            # --- Optimizer ---
-            scaler.step(opt)
-            scaler.update()
-            if torch.cuda.is_available(): torch.cuda.synchronize()
-            t4 = time.time()
 
-            fwd_t += (t1 - t0)
-            loss_t += (t2 - t1)
-            bwd_t += (t3 - t2)
-            step_t += (t4 - t3)
+def main():
+    device = "cuda"
+    gpu_name = torch.cuda.get_device_name(0)
+    print(f"🔥 硬件: {gpu_name}")
 
-        n = iters
-        fwd_ms = fwd_t / n * 1000.0
-        loss_ms = loss_t / n * 1000.0
-        bwd_ms = bwd_t / n * 1000.0
-        step_ms = step_t / n * 1000.0
-        total_ms = fwd_ms + loss_ms + bwd_ms + step_ms
+    # 参数（与你输出一致）
+    B = int(os.environ.get("BATCH", "4"))
+    C_AUX = 9
+    C_MAIN = 1
+    DIM = int(os.environ.get("DIM", "64"))
+    H = W = int(os.environ.get("SIZE", "120"))
+    T = int(os.environ.get("T", "3"))
 
-        print(f"   ⏱️ Model Fwd : {fwd_ms:.2f} ms")
-        print(f"   ⏱️ Loss Calc : {loss_ms:.2f} ms")
-        print(f"   ⏱️ Backward  : {bwd_ms:.2f} ms")
-        print(f"   ⏱️ Opt Step  : {step_ms:.2f} ms")
-        print(f"   ✅ Total Time: {total_ms:.2f} ms / iter")
+    TRAIN_SCALE = int(os.environ.get("CONSTRAINT_SCALE", "120"))
+    AMP = os.environ.get("AMP", "1") == "1"
 
-        return {"total_ms": total_ms}
+    # ✅ benchmark 时可选跳过 constraint（默认不跳过）
+    # 设为 1 时，会把 constraint_scale 传 None，从而 network.py 里跳过 constraint 计算
+    SKIP_CONSTRAINT = os.environ.get("BENCH_SKIP_CONSTRAINT", "0") == "1"
+    constraint_scale = None if SKIP_CONSTRAINT else TRAIN_SCALE
 
-    except Exception as e:
-        print(f"   ❌ Full Model 测试失败: {e}")
-        return {"total_ms": float("inf")}
-    finally:
-        _clean(model, criterion, aux_input, main_input, target)
+    print(f"⚙️ 测试参数: Batch={B}, Dim={DIM}, Size={H}x{W}, T={T}")
+    print(f"⚙️ 全模型 constraint_scale={constraint_scale}")
+
+    # dummy inputs
+    aux = torch.randn(B, C_AUX, T, H, W, device=device)
+    main_in = torch.rand(B, C_MAIN, T, H, W, device=device)  # log_norm 域，>=0
+    target = torch.rand(B, C_MAIN, T, H, W, device=device)
+
+    # 3D卷积模块（示例）
+    conv3d = nn.Conv3d(DIM, DIM, 3, padding=1).to(device)
+
+    # MoE模块 / Mamba模块 / Fusion模块：你这里按项目实际构建
+    # 这里沿用你目前脚本已有的构造方式（略）——重点是 full-model 部分
+    # 如果你原脚本里有更完整的 module 构造，请保留并仅替换 full-model benchmark 调用与 constraint 传参逻辑。
+
+    # 全模型
+    model = DSTCarbonFormer(aux_c=C_AUX, main_c=C_MAIN, dim=DIM).to(device)
+    criterion = HybridLoss(consistency_scale=10, norm_factor=11.0).to(device)
+
+    print("=========================")
+    print("🚀 准备进行 DSTCarbonFormer 全模型测试...")
+    print("--------------------------------------------------")
+    avg_ms = benchmark_full_model_trainstep(
+        model=model,
+        criterion=criterion,
+        aux=aux,
+        main=main_in,
+        target=target,
+        name="DSTCarbonFormer + HybridLoss",
+        constraint_scale=constraint_scale,
+        iters=20,
+        warmup=3,
+        amp=AMP,
+    )
+    _ = avg_ms
 
 
 if __name__ == "__main__":
-    if torch.cuda.is_available():
-        print(f"🔥 硬件: {torch.cuda.get_device_name(0)}")
-    
-    # =========================
-    # 测试参数
-    # =========================
-    B, T, H, W = 24, 3, 120, 120
-    DIM = 64
-    AUX_C = 9
-    MAIN_C = 1
-    
-    print(f"⚙️ 测试参数: Batch={B}, Dim={DIM}, Size={H}x{W}, T={T}")
-
-    # 构造数据
-    # 单模块用数据
-    df = torch.randn(B, DIM, T, H, W)
-    da = torch.randn(B, DIM, T, H, W)
-    
-    # 🔥 全模型用数据
-    # dra: 辅助数据 (9通道)
-    dra = torch.randn(B, AUX_C, T, H, W)
-    # dm: 主输入数据 (1通道, 也是 Mosaic 低清输入)
-    dm = torch.randn(B, MAIN_C, T, H, W)
-    # target: 目标数据 (1通道, 高清真值)
-    target = torch.randn(B, MAIN_C, T, H, W)
-
-    results_fwd = {}
-    results_step = {}
-
-    # ========== 1. 单模块测试 ==========
-    results_fwd["3D Conv"] = benchmark_forward("3D卷积", MultiScaleBlock3D(channels=DIM), df, iters=50)
-    results_step["3D Conv"] = benchmark_trainstep("3D卷积", MultiScaleBlock3D(channels=DIM), df, iters=10)
-
-    results_fwd["MoE"] = benchmark_forward("MoE", MoEBlock(dim=DIM, num_experts=3, top_k=1), df, iters=50)
-    results_step["MoE"] = benchmark_trainstep("MoE", MoEBlock(dim=DIM, num_experts=3, top_k=1), df, iters=10)
-
-    mamba_mod = MambaAdapter(dim=DIM)
-    # 编译 Mamba (实际上是 disable)
-    try:
-        mamba_mod = torch.compile(mamba_mod, mode='reduce-overhead')
-    except: pass
-    
-    results_fwd["Mamba"] = benchmark_forward("Mamba", mamba_mod, df, iters=50)
-    results_step["Mamba"] = benchmark_trainstep("Mamba", mamba_mod, df, iters=10)
-
-    results_fwd["Fusion"] = benchmark_forward("融合层", SFTLayer3D(channels=DIM), (df, da), iters=50)
-
-    # ========== 2. 🔥 全模型 + Loss 测试 ==========
-    print("\n=========================")
-    print("🚀 准备进行 DSTCarbonFormer 全模型测试...")
-    
-    full_model = DSTCarbonFormer(aux_c=AUX_C, main_c=MAIN_C, dim=DIM)
-    loss_fn = HybridLoss(consistency_scale=4) # 实例化 HybridLoss
-    
-    benchmark_full_model_trainstep(
-        name="DSTCarbonFormer + HybridLoss",
-        model=full_model,
-        criterion=loss_fn,
-        aux_input=dra,
-        main_input=dm,
-        target=target,
-        iters=20,
-        use_amp=True
-    )
-
-    # 汇总输出
-    print("\n=========================")
-    print("📊 Forward-only 结果汇总 (ms/batch)")
-    for k, v in results_fwd.items():
-        print(f"{k:12s}: {v:.2f} ms")
-
-    print("\n=========================")
-    print("📊 Trainstep 结果汇总 (ms/iter)")
-    for k, d in results_step.items():
-        if "total_ms" in d:
-            print(f"{k:12s}: total={d['total_ms']:.2f}")
-
-    print("\n✅ 测试完成。")
+    main()

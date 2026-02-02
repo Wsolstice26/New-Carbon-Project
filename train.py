@@ -1,238 +1,343 @@
+# -*- coding: utf-8 -*-
 import os
 import warnings
 import csv
+import sys
+import glob
+from collections import deque
+
 import torch
-import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import glob
 import numpy as np
 
 # ==========================================
-# 🔇 [日志静音]
+# 🔇 [日志静音 & 环境优化]
 # ==========================================
 warnings.filterwarnings("ignore", message=".*Dynamo does not know how to trace the builtin.*")
 warnings.filterwarnings("ignore", message=".*Unable to hit fast path of CUDAGraphs.*")
 warnings.filterwarnings("ignore", message=".*TensorFloat32 tensor cores.*")
 
-# ==========================================
-# 🚀 [环境补丁]
-# ==========================================
 cache_dir = os.path.expanduser("~/.cache/miopen")
 os.makedirs(cache_dir, exist_ok=True)
-os.environ['MIOPEN_USER_DB_PATH'] = cache_dir
-os.environ['MIOPEN_CUSTOM_CACHE_DIR'] = cache_dir
-os.environ['MIOPEN_FORCE_USE_WORKSPACE'] = '1'
-os.environ['MIOPEN_LOG_LEVEL'] = '4'
-os.environ['MIOPEN_DEBUG_CONV_GEMM'] = '0'
-os.environ['MKL_THREADING_LAYER'] = 'GNU'
-os.environ['MKL_SERVICE_FORCE_INTEL'] = '1'
 
-torch.set_float32_matmul_precision('high')
+os.environ.setdefault("MIOPEN_USER_DB_PATH", cache_dir)
+os.environ.setdefault("MIOPEN_CUSTOM_CACHE_DIR", cache_dir)
+os.environ.setdefault("MIOPEN_LOG_LEVEL", "0")
+os.environ.setdefault("MIOPEN_FIND_MODE", "1")
+os.environ.setdefault("MIOPEN_FORCE_USE_WORKSPACE", "1")
+
+torch.set_float32_matmul_precision("high")
 torch.backends.cudnn.benchmark = True
 
 from data.dataset import DualStreamDataset
 from models.network import DSTCarbonFormer
-from models.losses import HybridLoss 
-from config import CONFIG 
+from models.losses import HybridLoss
+from config import CONFIG
 
-def calc_detailed_metrics(pred_real, target_real, threshold=1e-6):
-    abs_diff = torch.abs(pred_real - target_real)
-    global_mae = abs_diff.mean().item()
-    mask_nonzero = target_real > threshold
-    mask_zero = ~mask_nonzero
-    nonzero_mae = abs_diff[mask_nonzero].mean().item() if mask_nonzero.sum() > 0 else 0.0
-    zero_mae = abs_diff[mask_zero].mean().item() if mask_zero.sum() > 0 else 0.0
-    mask_top1 = target_real > 1830
-    top1_mae = abs_diff[mask_top1].mean().item() if mask_top1.sum() > 0 else 0.0
-    balanced_mae = 0.5 * nonzero_mae + 0.5 * zero_mae
-    return global_mae, nonzero_mae, zero_mae, balanced_mae, top1_mae
+# ==========================================
+# 🛠️ Checkpoint 工具函数
+# ==========================================
 
 def get_latest_checkpoint(save_dir):
-    if not os.path.exists(save_dir): return None
-    latest_path = os.path.join(save_dir, "latest.pth")
-    if os.path.exists(latest_path): return latest_path
-    files = glob.glob(os.path.join(save_dir, "epoch_*.pth"))
-    if not files: return None
-    return max(files, key=os.path.getmtime)
+    latest = os.path.join(save_dir, "autosave_latest.pth")
+    if os.path.exists(latest):
+        return latest
+    return None
+
+
+def save_checkpoint(path, epoch, step, model, criterion, optimizer, scheduler, scaler, best_nonzero_mae):
+    torch.save(
+        {
+            "epoch": epoch,
+            "global_step": step,
+            "model_state_dict": model.state_dict(),
+            "criterion_state_dict": criterion.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "scaler_state_dict": scaler.state_dict() if scaler else None,
+            "best_nonzero_mae": best_nonzero_mae,
+        },
+        path,
+    )
+
+
+# ==========================================
+# 📊 Validation Metrics (GPU only)
+# ==========================================
+def calc_metrics_tensor(
+    pred_real: torch.Tensor,
+    target_real: torch.Tensor,
+    thr: float = 1e-6,
+    top_p_list=(0.01, 0.05),
+):
+    diff = torch.abs(pred_real - target_real)
+
+    global_mae = diff.mean()
+
+    mask_nz = target_real > thr
+    mask_z = ~mask_nz
+
+    nz_cnt = mask_nz.sum().clamp(min=1)
+    z_cnt = mask_z.sum().clamp(min=1)
+
+    nz_mae = diff[mask_nz].sum() / nz_cnt
+    z_mae = diff[mask_z].sum() / z_cnt
+
+    balanced_mae = 0.5 * nz_mae + 0.5 * z_mae
+
+    metrics = [global_mae, nz_mae, balanced_mae]
+
+    nz_target = target_real[mask_nz]
+
+    if nz_target.numel() < 10:
+        for _ in top_p_list:
+            metrics.append(nz_mae)
+    else:
+        for p in top_p_list:
+            q = torch.quantile(nz_target, 1.0 - p)
+            mask_top = target_real >= q
+            top_mae = diff[mask_top].sum() / mask_top.sum().clamp(min=1)
+            metrics.append(top_mae)
+
+    return torch.stack(metrics)
+
+
+# ==========================================
+# 🏃 主训练逻辑
+# ==========================================
 
 def train():
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"🔥 设备: {device} | 模式: 120x120 Final (Softmax Weighted)")
-    print(f"📂 数据集: {CONFIG['data_dir']}")
-    print(f"📏 Dim: {CONFIG.get('dim', 48)} | Batch: {CONFIG['batch_size']}")
-    
-    scaler = torch.amp.GradScaler('cuda', init_scale=65535.0)
-    os.makedirs(CONFIG['save_dir'], exist_ok=True)
-    
-    log_file = os.path.join(CONFIG['save_dir'], 'training_log.csv')
-    if not os.path.exists(log_file):
-        with open(log_file, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['Epoch', 'LR', 'Train_Loss', 'Val_Loss', 
-                             'MAE_Global', 'MAE_Balanced', 'MAE_Ext', 
-                             'W_CV', 'W_SSIM', 'W_TV', 'W_Cons'])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    is_cuda = device.type == "cuda"
 
-    # --- 加载数据 ---
-    print(f"📦 加载数据 (Workers={CONFIG['num_workers']})...")
-    train_ds = DualStreamDataset(CONFIG['data_dir'], CONFIG['split_config'], 'train', time_window=CONFIG['time_window'])
-    val_ds = DualStreamDataset(CONFIG['data_dir'], CONFIG['split_config'], 'val', time_window=CONFIG['time_window'])
-    
-    use_persistent = (CONFIG['num_workers'] > 0)
-    train_dl = DataLoader(train_ds, batch_size=CONFIG['batch_size'], shuffle=True, 
-                          num_workers=CONFIG['num_workers'], pin_memory=True, 
-                          persistent_workers=use_persistent)
-    val_dl = DataLoader(val_ds, batch_size=CONFIG['batch_size'], shuffle=False, 
-                        num_workers=CONFIG['num_workers'], pin_memory=True, 
-                        persistent_workers=use_persistent)
-    
-    print(f"✅ 样本数: Train={len(train_ds)} | Val={len(val_ds)}")
+    # -------------------------
+    # Config shortcuts
+    # -------------------------
+    SAVE_EVERY_STEPS = CONFIG["save_every_steps"]
+    KEEP_LAST_STEPS = CONFIG["keep_last_steps"]
+    SAVE_EVERY_EPOCHS = CONFIG["save_every_epochs"]
 
-    # --- 模型与 Loss ---
-    model = DSTCarbonFormer(aux_c=9, main_c=1, dim=CONFIG.get('dim', 48)).to(device)
-    criterion = HybridLoss(consistency_scale=CONFIG['consistency_scale']).to(device)
-    
-    optimizer = optim.AdamW(list(model.parameters()) + list(criterion.parameters()), lr=CONFIG['lr'], weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CONFIG['epochs'], eta_min=1e-6)
-    
+    TRAIN_SCALE = CONFIG.get("train_constraint_scale", 120)
+
+    print(f"🔥 Device: {device}")
+
+    # -------------------------
+    # Reproducibility
+    # -------------------------
+    if CONFIG.get("deterministic", False):
+        torch.manual_seed(CONFIG["seed"])
+        np.random.seed(CONFIG["seed"])
+        if is_cuda:
+            torch.cuda.manual_seed_all(CONFIG["seed"])
+
+    scaler = torch.amp.GradScaler("cuda", init_scale=65535.0) if is_cuda else None
+    os.makedirs(CONFIG["save_dir"], exist_ok=True)
+
+    # ==========================
+    # Dataset
+    # ==========================
+    train_ds = DualStreamDataset(
+        CONFIG["data_dir"], CONFIG["split_config"], "train",
+        time_window=CONFIG["time_window"]
+    )
+    val_ds = DualStreamDataset(
+        CONFIG["data_dir"], CONFIG["split_config"], "val",
+        time_window=CONFIG["time_window"]
+    )
+
+    global_nz_ratio = train_ds.global_nz_ratio
+    global_cv_log = train_ds.global_cv_log
+
+    print(
+        f"📊 [Global Stats] Nz/Nnz={global_nz_ratio:.2f}, "
+        f"CV_log={global_cv_log:.3f}"
+    )
+
+    loader_args = dict(
+        batch_size=CONFIG["batch_size"],
+        num_workers=CONFIG["num_workers"],
+        pin_memory=True,
+        persistent_workers=CONFIG["num_workers"] > 0,
+    )
+
+    train_dl = DataLoader(train_ds, shuffle=True, drop_last=True, **loader_args)
+    val_dl = DataLoader(val_ds, shuffle=False, drop_last=False, **loader_args)
+
+    # ==========================
+    # Model & Loss
+    # ==========================
+    model = DSTCarbonFormer(aux_c=9, main_c=1, dim=CONFIG["dim"]).to(device)
+
+    criterion = HybridLoss(
+        consistency_scale=CONFIG["consistency_scale"],
+        norm_factor=CONFIG["norm_factor"],
+        global_nz_ratio=global_nz_ratio,
+        global_cv_log=global_cv_log,
+    ).to(device)
+
+    optimizer = optim.AdamW(
+        list(model.parameters()) + list(criterion.parameters()),
+        lr=CONFIG["lr"],
+        weight_decay=1e-4,
+    )
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=CONFIG["epochs"], eta_min=1e-6
+    )
+
+    # ==========================
+    # Resume
+    # ==========================
     start_epoch = 1
-    best_balanced_mae = float('inf')
-    early_stop_counter = 0
+    global_step = 0
+    best_nonzero_mae = float("inf")
 
-    # --- 恢复断点 ---
-    if CONFIG['resume']:
-        latest_ckpt = get_latest_checkpoint(CONFIG['save_dir'])
-        if latest_ckpt:
-            print(f"🔄 恢复检查点: {latest_ckpt}")
-            try:
-                # 🔥🔥🔥【修复点】在这里加上 weights_only=False 🔥🔥🔥
-                # 告诉 PyTorch：这个文件是我生成的，是安全的，请加载全部数据
-                checkpoint = torch.load(latest_ckpt, map_location=device, weights_only=False)
-                
-                model.load_state_dict(checkpoint['model_state_dict'])
-                
-                # 尝试加载 Loss 状态
-                if 'criterion_state_dict' in checkpoint:
-                     try: 
-                         criterion.load_state_dict(checkpoint['criterion_state_dict'])
-                     except: 
-                         print("⚠️ Loss权重结构不匹配，已重置")
-                
-                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-                if 'scaler_state_dict' in checkpoint:
-                    scaler.load_state_dict(checkpoint['scaler_state_dict'])
-                start_epoch = checkpoint['epoch'] + 1
-                best_balanced_mae = checkpoint.get('best_balanced_mae', float('inf'))
-                print(f"✅ 恢复成功! 从 Ep {start_epoch} 开始")
-            except Exception as e:
-                print(f"⚠️ 恢复失败 ({e})，重新开始")
+    if CONFIG.get("resume", False):
+        ckpt_path = get_latest_checkpoint(CONFIG["save_dir"])
+        if ckpt_path:
+            print(f"🔁 Resuming from checkpoint: {ckpt_path}")
+            ckpt = torch.load(ckpt_path, map_location=device)
 
-    # --- 训练循环 ---
-    print(f"\n🚀 开始训练...")
-    for epoch in range(start_epoch, CONFIG['epochs']+1):
+            model.load_state_dict(ckpt["model_state_dict"])
+            criterion.load_state_dict(ckpt["criterion_state_dict"])
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+
+            if scaler and ckpt.get("scaler_state_dict") is not None:
+                scaler.load_state_dict(ckpt["scaler_state_dict"])
+
+            start_epoch = ckpt["epoch"] + 1
+            global_step = ckpt.get("global_step", 0)
+            best_nonzero_mae = ckpt.get("best_nonzero_mae", best_nonzero_mae)
+
+            print(
+                f"✅ Resume OK | start_epoch={start_epoch}, "
+                f"best_nonzero_mae={best_nonzero_mae:.4f}"
+            )
+
+    # ==========================
+    # Training Loop
+    # ==========================
+    for epoch in range(start_epoch, CONFIG["epochs"] + 1):
         model.train()
-        train_loss = 0
-        loop = tqdm(train_dl, desc=f"Ep {epoch}/{CONFIG['epochs']}")
-        
-        for aux, main, target in loop:
-            torch.compiler.cudagraph_mark_step_begin()
-            
-            aux, main, target = aux.to(device, non_blocking=True), main.to(device, non_blocking=True), target.to(device, non_blocking=True)
-            optimizer.zero_grad(set_to_none=True)
-            
-            with torch.amp.autocast('cuda'):
-                pred = model(aux, main)
-                # 🔥 Loss 恒为正
-                loss = criterion(pred, target, main) * 1000
-            
-            if torch.isnan(loss): 
-                print("⚠️ Loss is NaN!"); continue
+        train_loss = 0.0
 
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            
+        loop = tqdm(train_dl, desc=f"Ep {epoch}/{CONFIG['epochs']}")
+
+        for aux, main, target in loop:
+            aux = aux.to(device, non_blocking=True)
+            main = main.to(device, non_blocking=True)
+            target = target.to(device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+
+            with torch.amp.autocast("cuda", enabled=is_cuda):
+                pred, pred_raw = model(aux, main, constraint_scale=TRAIN_SCALE)
+                loss = criterion(pred, target, aux, pred_raw)
+
+            if scaler:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
+
             train_loss += loss.item()
-            
-            with torch.no_grad():
-                pred_real = torch.expm1(pred.float().detach() * CONFIG['norm_factor']).clamp(min=0)
-                target_real = torch.expm1(target.float() * CONFIG['norm_factor']).clamp(min=0)
-                _, _, _, b_mae, _ = calc_detailed_metrics(pred_real, target_real)
-            
-            loop.set_postfix(L=f"{loss.item():.3f}", B=f"{b_mae:.2f}")
-            
-        avg_train_loss = train_loss / len(train_dl) if len(train_dl) > 0 else 0
-        
-        # --- 验证 ---
+            global_step += 1
+            loop.set_postfix(L=f"{loss.item():.4f}")
+
+            # -------------------------
+            # 🔁 Step-level autosave (轮转 + latest)
+            # -------------------------
+            if global_step % SAVE_EVERY_STEPS == 0:
+                slot = (global_step // SAVE_EVERY_STEPS) % KEEP_LAST_STEPS
+
+                step_ckpt = os.path.join(
+                    CONFIG["save_dir"],
+                    f"autosave_step_{slot}.pth"
+                )
+                latest_ckpt = os.path.join(
+                    CONFIG["save_dir"],
+                    "autosave_latest.pth"
+                )
+
+                save_checkpoint(
+                    step_ckpt, epoch, global_step,
+                    model, criterion, optimizer, scheduler, scaler,
+                    best_nonzero_mae
+                )
+                save_checkpoint(
+                    latest_ckpt, epoch, global_step,
+                    model, criterion, optimizer, scheduler, scaler,
+                    best_nonzero_mae
+                )
+
+        # ==========================
+        # Validation
+        # ==========================
         model.eval()
-        val_loss = 0
-        total_metrics = np.zeros(5) 
-        batch_count = 0
-        
+        val_metrics = torch.zeros(5, device=device)
+        cnt = 0
+
         with torch.no_grad():
             for aux, main, target in val_dl:
-                torch.compiler.cudagraph_mark_step_begin()
-                aux, main, target = aux.to(device, non_blocking=True), main.to(device, non_blocking=True), target.to(device, non_blocking=True)
-                with torch.amp.autocast('cuda'):
-                    pred = model(aux, main)
-                    val_loss += (criterion(pred, target, main)* 1000.0).item()
-                    
-                    pred_real = torch.expm1(pred.float() * CONFIG['norm_factor']).clamp(min=0)
-                    target_real = torch.expm1(target.float() * CONFIG['norm_factor']).clamp(min=0)
-                    m = calc_detailed_metrics(pred_real, target_real)
-                    total_metrics += np.array(m)
-                    batch_count += 1
-        
-        avg_val_loss = val_loss / batch_count if batch_count > 0 else 0
-        avg_metrics = total_metrics / batch_count if batch_count > 0 else np.zeros(5)
-        
-        lr = optimizer.param_groups[0]['lr']
-        
-        # 🔥🔥🔥【关键修改】🔥🔥🔥
-        # 适配新的 Softmax 权重读取逻辑
-        with torch.no_grad():
-            # w_params -> softmax -> * 4.0
-            ws = torch.softmax(criterion.w_params, dim=0) * 4.0
-            ws = ws.cpu().numpy()
-        
-        print(f"   📊 Val Loss={avg_val_loss:.4f} | Bal MAE={avg_metrics[3]:.3f}")
-        print(f"   ⚖️ Weights -> CV:{ws[0]:.2f} SSIM:{ws[1]:.2f} TV:{ws[2]:.2f} Cons:{ws[3]:.2f}")
+                aux = aux.to(device, non_blocking=True)
+                main = main.to(device, non_blocking=True)
+                target = target.to(device, non_blocking=True)
 
-        # --- 保存记录 ---
-        with open(log_file, 'a', newline='') as f:
-            csv.writer(f).writerow([
-                epoch, f"{lr:.2e}", 
-                f"{avg_train_loss:.5f}", f"{avg_val_loss:.5f}", 
-                f"{avg_metrics[0]:.4f}", f"{avg_metrics[3]:.4f}", f"{avg_metrics[4]:.4f}", 
-                f"{ws[0]:.3f}", f"{ws[1]:.3f}", f"{ws[2]:.3f}", f"{ws[3]:.3f}"
-            ])
+                with torch.amp.autocast("cuda", enabled=is_cuda):
+                    pred, _ = model(aux, main, constraint_scale=TRAIN_SCALE)
 
-        ckpt = {
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'criterion_state_dict': criterion.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict(),
-            'scaler_state_dict': scaler.state_dict(),
-            'best_balanced_mae': best_balanced_mae
-        }
-        torch.save(ckpt, os.path.join(CONFIG['save_dir'], "latest.pth"))
+                pred_real = torch.expm1(pred * CONFIG["norm_factor"]).clamp(min=0)
+                target_real = torch.expm1(target * CONFIG["norm_factor"]).clamp(min=0)
 
-        if avg_metrics[3] < best_balanced_mae:
-            best_balanced_mae = avg_metrics[3]
-            early_stop_counter = 0
-            torch.save(model.state_dict(), os.path.join(CONFIG['save_dir'], "best_model.pth"))
-            print(f"   🏆 New Best Model Saved!")
-        else:
-            early_stop_counter += 1
-            print(f"   ⏳ No improve {early_stop_counter}/{CONFIG['patience']}")
-            
-        if early_stop_counter >= CONFIG['patience']: break
+                val_metrics += calc_metrics_tensor(pred_real, target_real)
+                cnt += 1
+
+        avg_metrics = (val_metrics / cnt).cpu().numpy()
+        global_mae, nz_mae, bal_mae, top1p, top5p = avg_metrics
+
+        print(
+            f"📊 Val | "
+            f"Nonzero={nz_mae:.4f} | "
+            f"Top-1%={top1p:.4f} | "
+            f"Top-5%={top5p:.4f} | "
+            f"Balanced={bal_mae:.4f}"
+        )
+
+        # -------------------------
+        # 🏆 Best model (Nonzero-MAE)
+        # -------------------------
+        if nz_mae < best_nonzero_mae:
+            best_nonzero_mae = nz_mae
+            torch.save(
+                model.state_dict(),
+                os.path.join(CONFIG["save_dir"], "best_model.pth"),
+            )
+            print(f"🏆 New Best Model! Nonzero-MAE={best_nonzero_mae:.4f}")
+
+        # -------------------------
+        # 🧊 Epoch-level permanent save
+        # -------------------------
+        if epoch % SAVE_EVERY_EPOCHS == 0:
+            epoch_ckpt = os.path.join(
+                CONFIG["save_dir"],
+                f"epoch_{epoch:03d}.pth"
+            )
+            save_checkpoint(
+                epoch_ckpt, epoch, global_step,
+                model, criterion, optimizer, scheduler, scaler,
+                best_nonzero_mae
+            )
+            print(f"🧊 Saved permanent checkpoint: epoch_{epoch:03d}.pth")
+
         scheduler.step()
+
 
 if __name__ == "__main__":
     train()
+

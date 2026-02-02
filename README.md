@@ -1,195 +1,197 @@
-# 🌍 Carbon Emission Super-Resolution (DSTCarbonFormer)
+# Carbon-Emission-Super-Resolution v3.0
 
-**基于 Mamba + MoE + 自适应 CV 动态加权损失的碳排放时空超分辨率重建框架**
-
-本项目实现了一个深度学习模型，旨在利用多源辅助数据（如夜间灯光、路网、NDVI等）将粗糙的碳排放数据重建为高分辨率的精细分布图。模型在 **v1.8** 版本中采用了 **DSTCarbonFormer** 架构，并首创了 **自适应变异系数损失 (Adaptive CV Loss)** 机制。该机制结合了**宏观比例反转**与**微观长尾加权**，配合 **FP32 精度统计保护**，彻底解决了长尾分布（Power-Law）下极端高排放点源（Top 1%）难以预测的痛点，同时完美适配 AMD ROCm 硬件环境。
+**弱监督碳排放超分辨率重建框架（Weakly-Supervised Carbon Emission Downscaling）**
 
 ---
 
-## ✨ 核心特性
+## 📌 项目简介
 
-* **📊 全自动实验记录 (Paper-Ready Logging) [New]**:
-    * **CSV 自动归档**: 训练过程中自动生成 `training_log.csv`，记录每个 Epoch 的 **Loss、学习率 (LR)、五维 MAE 指标**以及 **自适应权重 (W_Pixel, W_SSIM, W_TV)** 的变化曲线。
-    * **数据可视化友好**: 生成的数据格式可直接导入 Excel/Python 绘制论文所需的折线图，支持断点续训自动追加 (Append Mode)，防止数据丢失。
-    
-* **双流架构 (Dual-Stream) & SFT 融合**:
-    * **辅助流 (Aux Stream)**: 处理高分辨率多源辅助数据 (9通道: NTL, Road, Water, NDVI, etc.)。
-    * **主流 (Main Stream)**: 处理低分辨率碳排放数据。
-    * **SFT 融合**: 使用空间特征变换 (SFT) 层将辅助流的纹理信息动态注入主流中。
+本项目提出了一套 **面向碳排放栅格数据的弱监督超分辨率重建框架（v3.0）**，用于将 **1 km 分辨率的年度碳排放总量数据**，在 **总量守恒的物理约束下**，下推至 **100 m 高分辨率格网**。
 
-* **前沿计算架构 (Mamba & MoE)**:
-    * **Mamba (SSM)**: 引入状态空间模型替代传统 Transformer，在捕获超长程时空依赖的同时，保持线性计算复杂度。
-    * **混合专家系统 (MoE)**: 针对成都市不同功能区（高度城市化中心 vs 边缘生态区）进行动态计算资源分配。
+与传统“强监督像素对齐”的超分辨率方法不同，本框架：
 
-* **⚖️ 自适应变异系数混合损失 (v1.8 New - Adaptive CV Hybrid Loss)**:
-    * **双层动态平衡 (Dual-Layer Balancing)**:
-        * **宏观层 (Macro)**: 基于 Batch 内非零像素占比自动计算 `Ratio`，动态调整“城市”与“背景”的基础权重，拒绝死板的 1:1。
-        * **微观层 (Micro)**: 基于 **变异系数 (CV)** 自动感知 Batch 内的“贫富差距”。针对 $1/x$ 长尾分布，利用 `Log + CV` 动态放大高排放点（如超级工厂）的梯度贡献。
-    * **数值安全堡垒 (FP32 Guard)**: 
-        * 在 Loss 计算内部强制使用 **FP32** 进行统计量（均值、方差）计算，防止在 FP16 混合精度训练下因平方累加导致的数值溢出 (NaN)，专为 **AMD RX 9060 XT** 优化。
-    * **NaN 免疫清洗**: 内置显式 NaN 清洗机制，确保脏数据不会中断训练。
+* **不依赖真实的 100 m 碳排放标签**
+* 仅使用 **1 km 总量约束 + 多源辅助因子**
+* 通过 **物理一致性 + 分布约束 + 加权弱监督损失** 实现稳定、可解释的降尺度结果
 
-* **🎯 Balanced MAE 导向优化 (v1.7 New)**:
-    * 摒弃传统的 Global MAE，采用 **Balanced MAE (50% City + 50% Bg)** 作为早停 (Early Stopping) 的唯一依据，强迫模型攻克高排放难点区域。
-
-* **频率硬约束 (FFT Constraint)**:
-    * 集成 **SEN2SR 频率域约束**，通过 3D FFT 强制模型保留低频数值准确性，并有效缓解 1km 格子边缘的“棋盘效应”。
-
-* **硬件适配与稳定性 (AMD ROCm Optimized)**:
-    * 针对 **AMD Radeon RX 9060 XT** 显存管理进行专项优化。
-    * **NaN 免疫机制**: 通过梯度裁剪与显存碎块化回收，解决了在大 Batch 下的数值溢出问题。
+> 🎯 目标应用：
+> 城市/区域尺度碳排放精细化制图、空间异质性分析、政策评估与碳中和研究。
 
 ---
 
-## 📂 目录结构
+## 🧠 核心思想（v3.0）
+
+### 1️⃣ 弱监督而非强监督
+
+* 原始碳排放数据：**1 km 网格总量**
+* 不存在真实的 100 m 像素级标签
+* 本方法仅要求：
+
+  * **块级（1 km）总量一致**
+  * **空间分布合理**
+
+---
+
+### 2️⃣ 物理约束优先（Physics-Guided）
+
+通过 **Water-Filling（单纯形投影）物理约束层**，严格保证：
+
+* ✅ 非负性（Non-negativity）
+* ✅ 总量守恒（Block-wise Mass Conservation）
+* ✅ 数值稳定（无 NaN / 爆炸）
+
+支持 **训练 / 推理阶段不同约束尺度**：
+
+| 阶段 | 约束尺度                |
+| -- | ------------------- |
+| 训练 | 全局 / 大尺度（如 120×120） |
+| 推理 | 1 km（10×10）         |
+
+---
+
+### 3️⃣ 面向极端稀疏分布的弱监督损失（v3.0 核心）
+
+碳排放具有典型特征：
+
+* **大量 0 值（背景）**
+* **极少数高排放“尾部像素”**
+
+若直接用普通 MAE / L1，会被 0 值严重稀释。
+
+#### 👉 本项目采用 **双层加权 Pixel Loss**：
+
+##### 🔹 宏观层（Macro）
+
+* 根据 **全局 0 / 非 0 比例**
+* 使用 `log(Nz / Nnz)` 提升非 0 区域权重
+
+##### 🔹 微观层（Micro）
+
+* 在非 0 区域内部
+* 基于 `log1p(y)` + **log 域变异系数 CV**
+* 自动放大高排放像素（工业、能源密集区）
+
+✔ 最终采用 **归一化加权损失**，避免梯度爆炸或稀释。
+
+---
+
+## 🧩 模型结构概览
+
+**DSTCarbonFormer（3D 时序模型）**
+
+主要模块包括：
+
+* 多尺度深度可分离 3D 卷积（ROCm 友好）
+* SFT（Spatial Feature Transform）辅助引导
+* MoE（Mixture of Experts）空间分工
+* 高效全局上下文注意力
+* Mamba-like 低分辨率时序建模
+* 物理约束层（可开 / 可关）
+
+输入输出形式：
 
 ```text
-Carbon_SR_Project/
-├── data/               # 数据集处理模块
-│   └── dataset.py      # DualStreamDataset 定义 (含 Log 归一化/滑窗逻辑)
-├── models/             # 模型定义
-│   ├── network.py      # DSTCarbonFormer 主模型 (v1.7: Mamba+MoE)
-│   ├── blocks.py       # SFT层, 多尺度块, FFT约束层等
-│   └── losses.py       # HybridLoss (v1.7: 平衡掩码 + 正数权重)
-├── check_*.py          # 数据自检脚本 (data_stats, granular_stats, everything)
-├── config.py           # 全局配置文件 (路径、超参数)
-├── create_split.py     # 数据集划分脚本
-├── train.py            # 训练脚本 (v1.7: Balanced MAE 早停 + 实时监控)
-├── predict_vis.py      # 预测可视化脚本 (生成对比图)
-├── inference.py        # 全量推断脚本 (生成最终 .npy 结果)
-├── requirements.txt    # 依赖库列表
-└── README.md           # 项目说明文档
+输入：
+  Aux  : [B, 9, T, 120, 120]  多源辅助数据
+  Main : [B, 1, T, 120, 120]  1km 总量退化输入（log 域）
 
+输出：
+  Pred_raw         : 未约束预测（log 域）
+  Pred_constrained : 物理约束后预测（log 域）
 ```
 
 ---
 
-## 🛠️ 环境安装
+## 📊 训练目标与验证指标
 
-1. **克隆项目**
+### 🔥 主验证指标（唯一用于 Early Stop / Best Model）
 
-```bash
-git clone [https://github.com/Wsolstice26/Carbon-Emission-Super-Resolution.git](https://github.com/Wsolstice26/Carbon-Emission-Super-Resolution.git)
-cd Carbon-Emission-Super-Resolution
+* **Nonzero-MAE**
 
-```
+  > 只在真实排放区域评估误差，避免 0 值主导
 
-2. **激活环境**
-建议使用 Python 3.12+ 及对应的 ROCm PyTorch 环境。
+### 📈 辅助分析指标
 
-```bash
-source /home/wdc/mamba_env/bin/activate
+* Balanced MAE（0 / 非 0 各占 50%）
+* Top-1% Nonzero MAE（极端高排放）
+* Top-5% Nonzero MAE
 
+> Top-k 阈值 **自适应**（按分位数），而非固定数值。
+
+---
+
+## 💾 Checkpoint 与断点续训机制
+
+本项目采用 **多级、安全、可回溯的保存策略**：
+
+| 文件名                   | 作用                         |
+| --------------------- | -------------------------- |
+| `autosave_latest.pth` | 当前正在训练的自动保存                |
+| `autosave_step_*.pth` | 每 N step 轮转保存（可 Ctrl+Z 回滚） |
+| `epoch_010.pth`       | 每 10 个 epoch 的永久快照         |
+| `best_model.pth`      | **Nonzero-MAE 最优模型**       |
+| `latest.pth`          | 每 epoch 结束的最新状态            |
+
+✔ 支持 **自动 / 交互式断点续训**
+✔ 支持 **step 级 + epoch 级 双重容灾**
+
+---
+
+## 📁 项目结构说明
+
+```text
+Carbon-Emission-Super-Resolution/
+│
+├─ data/
+│   └─ Train_Data_Yearly_120/     # 年度训练数据
+│
+├─ models/
+│   ├─ network.py                 # DSTCarbonFormer 主模型
+│   ├─ losses.py                  # v3.0 弱监督损失
+│   ├─ blocks.py                  # 基础模块（MoE / SFT / Physics）
+│
+├─ data/
+│   └─ dataset.py                 # DualStreamDataset（含全局统计）
+│
+├─ config.py                      # 实验配置与路径管理
+├─ train.py                       # 训练主入口（支持断点）
+│
+├─ Checkpoints/
+│   └─ Run_xxx/                   # 实验结果
+│
+└─ README.md
 ```
 
 ---
 
-## 📦 数据准备
-
-数据应存放于 `config.py` 中 `data_dir` 指定的目录。
-
-### 文件命名格式
-
-* **输入特征 (Aux)**: `X_{Year}.npy` (例如 `X_2014.npy`)
-* 形状: `[N, 9, 128, 128]`
-* 内容: 9个波段的辅助地理数据。
-
-
-* **标签/粗糙数据 (Main)**: `Y_{Year}.npy` (例如 `Y_2014.npy`)
-* 形状: `[N, 1, 128, 128]`
-* 内容: 真实的碳排放数据。
-
-
-
-### 数据预处理
-
-运行以下命令生成数据集划分文件 (`split_config.json`)：
+## 🚀 快速开始
 
 ```bash
-python create_split.py
+# 1. 激活环境
+conda activate your_env
 
-```
-
-*该脚本会将数据按 8:1:1 划分为训练集、验证集和测试集。*
-
----
-
-## 🚀 运行步骤
-
-### 1. 系统自检 (可选但推荐)
-
-在开始漫长的训练前，检查显存占用（针对 16GB VRAM）和数据完整性：
-
-```bash
-python check_everything.py
-
-```
-
-### 2. 模型训练
-
-启动训练脚本。v1.7 版本会自动平衡城市与背景的权重，并实时显示 MAE。
-
-```bash
+# 2. 启动训练
 python train.py
-
 ```
 
-* **配置**: 修改 `config.py` 中的 `batch_size`, `lr`, `epochs` 等参数。
-* **输出**: 模型权重会保存在 `Checkpoints/` 目录下。
+首次训练会自动：
 
-### 3. 结果可视化
-
-训练完成后，查看模型在验证集上的表现（生成对比图）：
-
-```bash
-python predict_vis.py
-
-```
-
-* 生成的 `result_preview.png` 将展示：真实标签 vs 预测结果 vs 误差热力图。
-
-### 4. 全量推断
-
-生成 2014-2023 全年份的高分辨率碳排放数据：
-
-```bash
-python inference.py
-
-```
-
-* 结果将保存为 `Pred_{Year}.npy` 文件。
+* 计算全局 `Nz/Nnz`、`CV_log`
+* 写入实验目录
+* 生成完整 checkpoint 体系
 
 ---
 
-## ⚙️ 关键配置 (config.py)
+## 📌 版本说明
 
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `batch_size` | **20** | 针对 RX 9060 XT 优化的最佳值 (VRAM ~10GB) |
-| `lr` | **5e-5** | 初始学习率 (Loss 参数也会随此更新) |
-| `resume` | `True` | 是否开启断点续训 |
-| `patience` | 15 | 基于 **Balanced MAE** 的早停耐心值 |
-| `save_freq` | 5 | 每隔多少轮保存一次检查点 |
+### v3.0（当前）
 
----
-
-## 📊 性能指标 (v1.8 - Quantile Monitoring)
-
-模型摒弃了单一的全局 MAE，转而采用基于**真实数据分位数**的分层监控体系，确保模型在不同量级上“不偏科”：
-
-* **Balanced MAE**: 宏平均指标，用于早停 (Early Stopping) 判断。
-* **MAE_Bg (Background)**: 背景区域误差 ($y=0$)，监控“幻觉/噪点”抑制能力。
-* **MAE_Norm (Normal)**: 普通城区误差 ($0 < y \le Q_{90}$)，监控基础结构恢复能力。
-* **MAE_High (High)**: 重点排放区误差 ($Q_{90} < y \le Q_{99}$)。
-* **MAE_Ext (Extreme)**: **核心指标**。极端高排放源误差 ($y > Q_{99}$，即 >1830吨)，监控模型对 Top 1% 超级点源的攻坚能力。
+* ✅ 弱监督 Pixel Loss（宏观 + 微观）
+* ✅ 全局统计自动计算（Dataset 内）
+* ✅ 物理一致性 Water-Filling
+* ✅ Nonzero-MAE 作为唯一主指标
+* ✅ 工程级 checkpoint 体系
+* ✅ ROCm / AMD GPU 友好
 
 ---
 
-## 📝 引用与致谢
-
-本项目参考了 SEN2SR 的频率约束思想与 SFT (Spatial Feature Transform) 融合机制。
-如果您在研究中使用了本项目，请引用相关代码库。
-
----
-
-*Last Updated: 2026-01-29 (v1.7 Release)*

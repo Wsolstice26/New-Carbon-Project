@@ -1,13 +1,26 @@
-# .gitignore
+# =========================
+# Training outputs
+# =========================
+Checkpoints/
+*.pth
+*.pt
+
+# =========================
+# Data (DO NOT COMMIT)
+# =========================
+data/Raw_TIF_Input/
+data/Train_Data_Yearly_120/
+data/Train_Data_Yearly_160/
+data/Train_Data_Yearly_Coords/
+*.npy
+*.npz
+*.tif
+*.tif.aux.xml
+
+# =========================
+# Logs / cache
+# =========================
 __pycache__/
 *.pyc
-.DS_Store
-
-# 忽略数据集和输出
-data/
-Checkpoints/
-results/
-logs/
-
-# 忽略 MIOpen 缓存 (因为它是特定于机器硬件的)
-.cache/
+*.csv
+*.log
