@@ -1,11 +1,77 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.fft
 
 # ==========================================
-# 1. 多尺度感知模块 (Multi-Scale Block)
-# 🚀 深度可分离卷积优化版 (AMD ROCm Friendly)
+# 0. [新增] 基础工具：DropPath
+#    用于深层网络的正则化，防止过拟合和梯度消失
+# ==========================================
+class DropPath(nn.Module):
+    """
+    Stochastic Depth (DropPath) for residual connections.
+    Ref: https://github.com/rwightman/pytorch-image-models
+    """
+    def __init__(self, drop_prob=None):
+        super(DropPath, self).__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        if self.drop_prob == 0. or not self.training:
+            return x
+        keep_prob = 1 - self.drop_prob
+        # handle broadcasting for different tensor shapes
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1) 
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()  # binarize
+        output = x.div(keep_prob) * random_tensor
+        return output
+
+# ==========================================
+# 1. [新增] 轻量级时序卷积 (Temporal DWConv)
+#    专门针对 T=3 设计，强制模型在空间操作前看前后帧
+# ==========================================
+class TemporalDWConv3d(nn.Module):
+    def __init__(self, dim, kernel_size=3):
+        super().__init__()
+        self.t_conv = nn.Conv3d(
+            dim, dim, 
+            kernel_size=(kernel_size, 1, 1), # 只在 T 维度卷积 (3, 1, 1)
+            stride=1, 
+            padding=(kernel_size//2, 0, 0),  # 保持时间维度 T 不变
+            groups=dim,                      # Depthwise 分组卷积，省参数
+            bias=False
+        )
+    
+    def forward(self, x):
+        return self.t_conv(x)
+
+# ==========================================
+# 2. [新增] 门控融合层 (Gated Fusion)
+#    替代 Cross-Attention，用于 Aux 和 Main 的高效融合
+# ==========================================
+class GatedFusion(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.gate_conv = nn.Conv3d(dim * 2, 1, kernel_size=1, bias=True)
+        self.aux_proj = nn.Conv3d(dim, dim, kernel_size=1, bias=False)
+        
+    def forward(self, x, aux):
+        # x: Main Feature [B, C, T, H, W]
+        # aux: Aux Feature [B, C, T, H, W]
+        
+        # 1. 计算门控系数 (0~1)
+        cat_feat = torch.cat([x, aux], dim=1)
+        gate = torch.sigmoid(self.gate_conv(cat_feat))
+        
+        # 2. 投影 Aux 特征
+        aux_out = self.aux_proj(aux)
+        
+        # 3. 加权融合 (Residual)
+        return x + gate * aux_out
+
+# ==========================================
+# 3. 多尺度感知模块 (MultiScale Block)
+#    用于 Aux Head 提取路网等多尺度特征
 # ==========================================
 class MultiScaleBlock3D(nn.Module):
     def __init__(self, channels):
@@ -32,9 +98,9 @@ class MultiScaleBlock3D(nn.Module):
         out = torch.cat([b1, b2, b3, b4], dim=1)
         return self.fusion(out) + x
 
-
 # ==========================================
-# 2. [轻量版] SFT 融合层 (Lite SFT)
+# 4. SFT 融合层 (Lite SFT)
+#    用于空间特征调制 (仿射变换)
 # ==========================================
 class SFTLayer3D(nn.Module):
     def __init__(self, channels):
@@ -50,9 +116,9 @@ class SFTLayer3D(nn.Module):
         scale, shift = torch.chunk(scale_shift, 2, dim=1)
         return main * (1 + scale) + shift
 
-
 # ==========================================
-# 3. 高效全局注意力 (Efficient Global Context)
+# 5. 高效全局注意力 (Efficient Context)
+#    轻量级 SE-Block，用于通道重校准
 # ==========================================
 class EfficientContextBlock(nn.Module):
     def __init__(self, dim):
@@ -70,54 +136,16 @@ class EfficientContextBlock(nn.Module):
     def forward(self, x):
         b, c, t, h, w = x.shape
         identity = x
+        # 全局平均池化 -> MLP -> 通道权重
         y = self.reduce_conv(x)
         y = self.avg_pool(y).view(b, -1)
         y = self.mlp(y).view(b, c, 1, 1, 1)
         out = x * y
         return self.restore_conv(out) + identity
 
-
 # ==========================================
-# 4. [备份] 频率硬约束层 (Frequency Constraint)
-# ==========================================
-class FrequencyHardConstraint(nn.Module):
-    def __init__(self, radius=16):
-        super().__init__()
-        self.radius = radius 
-
-    def get_low_pass_filter(self, shape, device):
-        b, c, t, h, w = shape
-        center_h, center_w = h // 2, w // 2
-        y = torch.arange(h, device=device)
-        x = torch.arange(w, device=device)
-        grid_y, grid_x = torch.meshgrid(y, x, indexing='ij')
-        dist = (grid_x - center_w)**2 + (grid_y - center_h)**2
-        mask = torch.zeros((h, w), device=device)
-        mask[dist <= self.radius**2] = 1.0
-        return mask.view(1, 1, 1, h, w)
-
-    def forward(self, pred, input_main):
-        with torch.amp.autocast('cuda', enabled=False):
-            pred = pred.float()
-            input_main = input_main.float()
-            if pred.shape != input_main.shape:
-                input_main = F.interpolate(
-                    input_main.view(input_main.shape[0], -1, input_main.shape[3], input_main.shape[4]),
-                    size=pred.shape[-2:], mode='bilinear', align_corners=False
-                ).view_as(pred)
-            fft_pred = torch.fft.fftn(pred, dim=(-2, -1))
-            fft_input = torch.fft.fftn(input_main, dim=(-2, -1))
-            fft_pred_shift = torch.fft.fftshift(fft_pred, dim=(-2, -1))
-            fft_input_shift = torch.fft.fftshift(fft_input, dim=(-2, -1))
-            mask = self.get_low_pass_filter(pred.shape, pred.device)
-            fft_fused_shift = fft_input_shift * mask + fft_pred_shift * (1 - mask)
-            fft_fused = torch.fft.ifftshift(fft_fused_shift, dim=(-2, -1))
-            output = torch.fft.ifftn(fft_fused, dim=(-2, -1)).real
-            return output
-
-
-# ==========================================
-# 5. MoE 模块 
+# 6. MoE 模块 (Mixture of Experts)
+#    用于增强模型的非线性表达能力
 # ==========================================
 class MoEBlock(nn.Module):
     def __init__(self, dim, num_experts=4, top_k=2):
@@ -126,7 +154,6 @@ class MoEBlock(nn.Module):
         self.top_k = top_k
         self.dim = dim
 
-        # gate: Linear(C->E) 等价于 1x1x1 Conv(C->E)
         self.gate = nn.Conv3d(dim, num_experts, kernel_size=1, bias=True)
 
         self.experts_layer1 = nn.Conv3d(dim, dim * num_experts, kernel_size=1)
@@ -143,122 +170,55 @@ class MoEBlock(nn.Module):
         E = self.num_experts
         K = self.top_k
 
-        # logits: [B, E, T, H, W]  （无 permute）
         logits = self.gate(x)
 
         if K < E:
-            # topk over expert-dim
-            topk_vals, topk_idx = torch.topk(logits, k=K, dim=1)  # [B,K,T,H,W]
-
-            # 只在 topk 上做 softmax（等价于 masked -inf softmax）
-            topk_w = F.softmax(topk_vals, dim=1).to(dtype=x.dtype)  # [B,K,T,H,W]
-
-            # scatter 回完整 E 维 weights: [B,E,T,H,W]
-            weights = torch.zeros_like(logits, dtype=x.dtype)       # 直接用 x.dtype，少一次 cast
+            topk_vals, topk_idx = torch.topk(logits, k=K, dim=1)
+            topk_w = F.softmax(topk_vals, dim=1).to(dtype=x.dtype)
+            weights = torch.zeros_like(logits, dtype=x.dtype)
             weights.scatter_(1, topk_idx, topk_w)
         else:
             weights = F.softmax(logits, dim=1).to(dtype=x.dtype)
 
-        # experts 输出: [B, E*C, T,H,W] -> [B,E,C,T,H,W]
         expert_out = self.experts_layer2(self.act(self.experts_layer1(x)))
         expert_out = expert_out.view(B, E, C, T, H, W)
 
-        # weights: [B,E,T,H,W] -> [B,E,1,T,H,W]
         weights = weights.unsqueeze(2)
-
-        out = (expert_out * weights).sum(dim=1)  # [B,C,T,H,W]
+        out = (expert_out * weights).sum(dim=1)
         return out + x
 
-
-
-
+from mamba_ssm import Mamba    
 # ==========================================
-# 6. [修正] 物理约束层 (Water-Filling) - 支持动态 Scale
+# 8. [新增] 双向 Mamba 适配器 (Bi-Mamba)
+#    对于图像/视频重建任务，必须同时感知上下文
 # ==========================================
-class PhysicsConstraintLayer(nn.Module):
-    """
-    基于 Water-Filling (单纯形投影) 的物理约束层。
-    保证：
-    1) 非负性 (Non-negative)
-    2) 均值/总量守恒 (Mean/Sum Consistency)  —— 在指定 block scale 上
-    3) 数值稳定 (No NaN)
-
-    关键修正：
-    - 支持 forward 传入 scale，实现训练(全局/4km) 与推理(1km) 不同约束尺度。
-    """
-    def __init__(self, scale_factor=10, norm_const=11.0):
+class BiMambaBlock(nn.Module):
+    def __init__(self, dim, d_state=16, d_conv=4, expand=2):
         super().__init__()
-        self.default_scale = int(scale_factor)
-        self.norm_const = float(norm_const)
-
-    def water_filling_projection(self, pred_linear, input_down, scale: int):
-        """
-        pred_linear: [B, C, T, H, W] 线性域，非负
-        input_down:  [B, C, T, H/s, W/s] 线性域的 block 均值
-        scale:       block 尺度 s
-        """
-        B, C, T, H, W = pred_linear.shape
-        s = int(scale)
-        assert H % s == 0 and W % s == 0, f"H,W must be divisible by scale={s}, got {(H, W)}"
-        n = s * s  # block 内像素数
-
-        # 1) 目标总和 S：均值 * 像素数
-        S = input_down * n  # [B,C,T,h_grid,w_grid]
-
-        # 2) reshape 到 block 向量
-        h_grid, w_grid = H // s, W // s
-        p_blocks = (
-            pred_linear.view(B, C, T, h_grid, s, w_grid, s)
-                      .permute(0, 1, 2, 3, 5, 4, 6)
-                      .reshape(B, C, T, h_grid, w_grid, n)
+        # 正向 Mamba
+        self.fwd_mamba = Mamba(
+            d_model=dim, 
+            d_state=d_state, 
+            d_conv=d_conv, 
+            expand=expand
         )
-
-        p_flat = p_blocks.reshape(-1, n)   # [Nblock, n]
-        S_flat = S.reshape(-1, 1)          # [Nblock, 1]
-
-        # 3) sort-based simplex projection (Duchi-style)
-        u, _ = torch.sort(p_flat, dim=-1, descending=True)  # [Nblock, n]
-        cssv = torch.cumsum(u, dim=-1)                      # [Nblock, n]
-        k = torch.arange(1, n + 1, device=pred_linear.device).view(1, n)  # [1, n]
-        t = (cssv - S_flat) / k                              # [Nblock, n]
-
-        mask = u > t
-        rho = mask.sum(dim=-1, keepdim=True).clamp(min=1)   # [Nblock, 1]
-        theta = t.gather(dim=-1, index=rho - 1)             # [Nblock, 1]
-
-        q_flat = torch.clamp(p_flat - theta, min=0.0)       # [Nblock, n]
-
-        # 4) reshape 回原图
-        q_blocks = q_flat.view(B, C, T, h_grid, w_grid, n)
-        q_out = (
-            q_blocks.view(B, C, T, h_grid, w_grid, s, s)
-                   .permute(0, 1, 2, 3, 5, 4, 6)
-                   .reshape(B, C, T, H, W)
+        # 反向 Mamba
+        self.bwd_mamba = Mamba(
+            d_model=dim, 
+            d_state=d_state, 
+            d_conv=d_conv, 
+            expand=expand
         )
-        return q_out
-
-    def forward(self, pred_log_norm, input_mosaic_log_norm, scale=None):
-        """
-        pred_log_norm:         [B, C, T, H, W]   (log1p(x)/norm_const)
-        input_mosaic_log_norm: [B, C, T, H, W]   同形状，作为守恒约束来源
-        scale: int or None     block 尺度；None 则用 default_scale
-        """
-        s = int(scale) if scale is not None else self.default_scale
-
-        # 1) 还原线性空间（非负）
-        pred_linear = torch.expm1(pred_log_norm * self.norm_const).clamp(min=0)
-        input_linear = torch.expm1(input_mosaic_log_norm * self.norm_const).clamp(min=0)
-
-        # 2) 计算 block 均值（在 scale=s 的尺度上）
-        input_down = F.avg_pool3d(
-            input_linear,
-            kernel_size=(1, s, s),
-            stride=(1, s, s)
-        )  # [B,C,T,H/s,W/s]
-
-        # 3) Water-Filling 投影（在同一个尺度上守恒）
-        corrected_linear = self.water_filling_projection(pred_linear, input_down, s)
-
-        # 4) 回到 log 归一化空间
-        corrected_log_norm = torch.log1p(corrected_linear) / self.norm_const
-        return corrected_log_norm
+    
+    def forward(self, x):
+        # x: [B, L, C]
+        
+        # 1. 正向扫描
+        x_fwd = self.fwd_mamba(x)
+        
+        # 2. 反向扫描 (先翻转序列，处理完再翻转回来)
+        # dim=1 是序列长度维度 L
+        x_bwd = self.bwd_mamba(x.flip(dims=[1])).flip(dims=[1])
+        
+        # 3. 结果融合 (相加)
+        return x_fwd + x_bwd

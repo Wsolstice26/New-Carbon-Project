@@ -1,240 +1,196 @@
+# -*- coding: utf-8 -*-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 
 # ============================================================
-# 0. Weakly-supervised Weighted Pixel Loss  (NEW)
+# Loss A: Weighted Linear L1 Loss (Pixel-wise Sum Reduction)
 # ============================================================
-class WeightedPixelLoss(nn.Module):
+class WeightedL1Loss(nn.Module):
     """
-    Weakly-supervised pixel reconstruction loss.
+    [线性一致性损失 - 像素级求和版] 
+    直接优化 |pred - gt|。
+    
+    关键变化：
+    使用 Sum Reduction (除以 BatchSize) 替代 Mean Reduction。
+    这意味着：模型不再通过"平均"来稀释误差，而是必须面对每一个像素的绝对误差总和。
+    这对于稀疏的高排放点（High Values）至关重要。
+    """
+    def __init__(self, use_charbonnier: bool = False, eps: float = 1e-6):
+        super().__init__()
+        self.use_charbonnier = bool(use_charbonnier)
+        self.eps = float(eps)
 
-    - Macro: global log(Nz / Nnz) boost for non-zero pixels
-    - Micro: w_micro = 1 + alpha * log1p(y)
-    - Normalized: sum(w * loss) / sum(w)   (avoid dilution)
+    def forward(self, pred: torch.Tensor, gt: torch.Tensor, nz_ratio: torch.Tensor, cv: torch.Tensor) -> torch.Tensor:
+        # pred/gt: [B,1,T,12,12] (物理数值)
+        
+        # 1. 计算线性差值
+        diff = pred - gt
+        
+        if self.use_charbonnier:
+            # Charbonnier Loss (L1 的平滑版)
+            loss_map = torch.sqrt(diff * diff + self.eps * self.eps)
+        else:
+            # 标准 L1
+            loss_map = diff.abs()
+            
+        # 2. 动态权重计算 (保持原逻辑，这对于处理长尾分布很重要)
+        mask_nz = gt > 0
+        weights = torch.ones_like(gt)
+        
+        if mask_nz.any():
+            # A. 全局权重: log(nz_ratio)
+            if isinstance(nz_ratio, torch.Tensor) and nz_ratio.ndim == 1:
+                w_global = torch.log(nz_ratio.view(-1, 1, 1, 1, 1) + 1e-6)
+                w_global = w_global.expand_as(gt)
+            else:
+                w_global = torch.log(nz_ratio + 1e-6)
+            
+            # B. 局部权重: (1 + log1p(GT)) * CV
+            if isinstance(cv, torch.Tensor) and cv.ndim == 1:
+                cv_val = cv.view(-1, 1, 1, 1, 1).expand_as(gt)
+            else:
+                cv_val = cv
+
+            w_local = (1.0 + torch.log1p(gt)) * cv_val
+            
+            # 截断权重防止梯度爆炸 (1.0 ~ 20.0)
+            w_final_nz = (w_global * w_local).clamp(min=1.0, max=20.0) 
+            weights[mask_nz] = w_final_nz[mask_nz]
+
+        # 🚀【核心修改】Mean -> Sum
+        # 计算每个样本的总误差，然后对 Batch 取平均。
+        # 这样既保留了 Sum 的强梯度特性，又防止 Batch Size 变化影响 Loss 规模。
+        return (loss_map * weights.detach()).sum() / pred.size(0)
+
+
+# ============================================================
+# Loss B: Sparsity prior (Sum Reduction)
+# ============================================================
+class SparsityLoss(nn.Module):
+    """
+    [稀疏损失] 约束 100m 细节，防止底噪。
+    """
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, pred: torch.Tensor) -> torch.Tensor:
+        # 🚀【核心修改】Mean -> Sum
+        # 保持与主 Loss 量级一致
+        return pred.abs().sum() / pred.size(0)
+
+
+# ============================================================
+# Loss C: Block Entropy Loss
+# ============================================================
+class BlockEntropyLoss(nn.Module):
+    """
+    [熵损失] 约束 100m 纹理，防止方块效应。
+    (注意：在 Sum 模式下，Entropy 的数值相对较小，需要在 Config 里调大权重或者直接忽略)
     """
     def __init__(
         self,
-        norm_factor: float,
-        global_nz_ratio: float,
-        global_cv_log: float,
-        eps: float = 1e-6,
-        max_weight: float = 50.0,
+        scale: int = 10,
+        mode: str = "max",
+        target_entropy: float = 1.5,
+        eps: float = 1e-8,
+        soft_valid_k: float = 20.0,
     ):
         super().__init__()
-        self.norm_factor = float(norm_factor)
-        self.eps = eps
-        self.max_weight = max_weight
-
-        # ===== Macro: non-zero global log amplifier =====
-        self.w_macro_nz = math.log1p(global_nz_ratio)
-
-        # ===== Micro: global CV_log -> alpha =====
-        self.alpha = float(global_cv_log)
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """
-        pred / target: log1p(x) / norm_factor domain
-        """
-
-        # ----- linear-domain emission (for weighting only) -----
-        y_lin = torch.expm1(target * self.norm_factor).clamp(min=0.0)
-
-        mask_nz = (y_lin > 0).to(pred.dtype)
-        mask_z  = 1.0 - mask_nz
-
-        # ----- base reconstruction loss (Charbonnier in log-domain) -----
-        diff = pred - target
-        base_loss = torch.sqrt(diff * diff + self.eps**2)
-
-        # ----- micro weight (non-zero only) -----
-        w_micro = 1.0 + self.alpha * torch.log1p(y_lin)
-
-        # ----- macro + micro combination -----
-        w = torch.ones_like(y_lin, dtype=pred.dtype)
-        w = w + mask_nz * self.w_macro_nz
-        w = w * (mask_z + mask_nz * w_micro)
-        w = torch.clamp(w, max=self.max_weight)
-
-        # ----- normalized weighted loss -----
-        return (w.detach() * base_loss).sum() / (w.sum() + self.eps)
-
-
-# ============================================================
-# 1. Edge-Aware TV Loss (unchanged)
-# ============================================================
-class EdgeAwareTVLoss(nn.Module):
-    """
-    pred: [B, 1, T, H, W]
-    aux:  [B, C, T, H, W]
-    """
-    def __init__(self, alpha: float = 3.0, beta: float = 0.1):
-        super().__init__()
-        self.alpha = float(alpha)
-        self.beta = float(beta)
-
-    @staticmethod
-    def _get_gradient(x: torch.Tensor) -> torch.Tensor:
-        h_grad = torch.abs(x[:, :, :, 1:, :] - x[:, :, :, :-1, :])
-        h_grad = F.pad(h_grad, (0, 0, 0, 1, 0, 0), mode="replicate")
-
-        w_grad = torch.abs(x[:, :, :, :, 1:] - x[:, :, :, :, :-1])
-        w_grad = F.pad(w_grad, (0, 1, 0, 0, 0, 0), mode="replicate")
-
-        return h_grad + w_grad
-
-    def forward(self, pred: torch.Tensor, aux: torch.Tensor) -> torch.Tensor:
-        pred_safe = pred.clamp(min=0)
-
-        aux_guide = (aux[:, 0:1, ...] + aux[:, 6:7, ...]) / 2.0
-        aux_grad = self._get_gradient(aux_guide)
-
-        scale = aux_grad.mean().clamp(min=1e-8)
-        aux_grad_norm = aux_grad / scale
-
-        weight = torch.exp(-self.alpha * aux_grad_norm)
-        pred_grad = self._get_gradient(pred_safe)
-
-        return (weight * pred_grad).mean() + self.beta * pred_grad.mean()
-
-
-# ============================================================
-# 2. Distribution Loss (unchanged)
-# ============================================================
-class DistributionLoss(nn.Module):
-    def __init__(self, target_entropy: float = 1.5, scale: int = 10, eps: float = 1e-8):
-        super().__init__()
-        self.target_entropy = float(target_entropy)
         self.scale = int(scale)
+        self.mode = str(mode)
+        self.target_entropy = float(target_entropy)
         self.eps = float(eps)
+        self.soft_valid_k = float(soft_valid_k)
 
     def forward(self, pred: torch.Tensor) -> torch.Tensor:
-        pred_safe = pred.clamp(min=0)
-        B, C, T, H, W = pred_safe.shape
-
+        x = pred.clamp(min=0.0)
+        B, C, T, H, W = x.shape
         s = self.scale
-        if (H % s) != 0 or (W % s) != 0:
-            raise ValueError(f"H,W must be divisible by scale={s}, got H,W={(H, W)}")
+        
+        if H % s != 0 or W % s != 0:
+            return torch.tensor(0.0, device=x.device, requires_grad=True)
 
         h_grid, w_grid = H // s, W // s
         n = s * s
 
         blocks = (
-            pred_safe.view(B, C, T, h_grid, s, w_grid, s)
-                     .permute(0, 1, 2, 3, 5, 4, 6)
-                     .reshape(B, C, T, h_grid, w_grid, n)
+            x.view(B, C, T, h_grid, s, w_grid, s)
+             .permute(0, 1, 2, 3, 5, 4, 6)
+             .reshape(B, C, T, h_grid, w_grid, n)
         )
 
         block_sum = blocks.sum(dim=-1, keepdim=True)
-        valid = (block_sum.squeeze(-1) > self.eps)
-
         p = blocks / (block_sum + self.eps)
-        entropy_block = -(p * torch.log(p + self.eps)).sum(dim=-1)
+        entropy = -(p * torch.log(p + self.eps)).sum(dim=-1)
 
-        if valid.any():
-            entropy_mean = entropy_block[valid].mean()
-        else:
-            entropy_mean = torch.zeros((), device=pred.device, dtype=pred.dtype)
+        soft_valid = torch.sigmoid(self.soft_valid_k * (block_sum.squeeze(-1) - self.eps)).to(entropy.dtype)
+        denom = soft_valid.sum().clamp(min=1.0)
+        entropy_mean = (entropy * soft_valid).sum() / denom
 
+        if self.mode == "max":
+            return -entropy_mean
         return torch.abs(entropy_mean - self.target_entropy)
 
 
 # ============================================================
-# 3. Temporal Loss (unchanged)
-# ============================================================
-class TemporalLoss(nn.Module):
-    def forward(self, pred: torch.Tensor) -> torch.Tensor:
-        pred_safe = pred.clamp(min=0)
-        diff = torch.abs(pred_safe[:, :, 1:, ...] - pred_safe[:, :, :-1, ...])
-        return diff.mean()
-
-
-# ============================================================
-# 4. Hybrid Loss (UPDATED: + Pixel Loss)
+# Criterion: HybridLoss (Targeting High R2)
 # ============================================================
 class HybridLoss(nn.Module):
-    """
-    Loss components:
-      0) Pixel reconstruction (weak supervision, weighted)
-      1) Pre-Consistency (linear-domain, 1km)
-      2) Edge-aware TV
-      3) Entropy
-      4) Temporal
-    """
     def __init__(
         self,
         consistency_scale: int = 10,
-        norm_factor: float = 11.0,
-        global_nz_ratio: float = 100.0,
-        global_cv_log: float = 1.0,
-        eps: float = 1e-8,
+        w_sparse: float = 1e-3,
+        w_ent: float = 1e-3,
+        ent_mode: str = "max",          
+        target_entropy: float = 1.5,    
+        use_charbonnier_A: bool = False,
     ):
         super().__init__()
-        self.scale = int(consistency_scale)
-        self.norm_factor = float(norm_factor)
-        self.eps = float(eps)
+        self.w_sparse = float(w_sparse)
+        self.w_ent = float(w_ent)
 
-        # ----- NEW pixel loss -----
-        self.pixel_loss = WeightedPixelLoss(
-            norm_factor=norm_factor,
-            global_nz_ratio=global_nz_ratio,
-            global_cv_log=global_cv_log,
+        # 1. 主 Loss (Linear Sum)
+        self.loss_A = WeightedL1Loss(use_charbonnier=use_charbonnier_A)
+        
+        # 2. 辅助 Loss
+        self.loss_B = SparsityLoss()
+        self.loss_C = BlockEntropyLoss(
+            scale=consistency_scale, 
+            mode=ent_mode, 
+            target_entropy=target_entropy
         )
-
-        self.edge_tv_loss = EdgeAwareTVLoss(alpha=3.0)
-        self.dist_loss = DistributionLoss(target_entropy=1.5, scale=self.scale)
-        self.temp_loss = TemporalLoss()
-
-        # log_vars: [Pixel, PreCons, EdgeTV, Entropy, Temporal]
-        self.log_vars = nn.Parameter(torch.zeros(5))
-
-    def _to_linear(self, x_log_norm: torch.Tensor) -> torch.Tensor:
-        x_lin = torch.expm1(x_log_norm * self.norm_factor)
-        return x_lin.clamp(min=0.0)
 
     def forward(
         self,
-        pred: torch.Tensor,
-        target: torch.Tensor,
-        aux: torch.Tensor,
-        pred_raw=None
+        pred: torch.Tensor,               
+        target: torch.Tensor,             
+        pred_100m: torch.Tensor = None,   
+        nz_ratio_win: torch.Tensor = None,
+        cv_log_win: torch.Tensor = None
     ) -> torch.Tensor:
-        main_pred = pred_raw if pred_raw is not None else pred
+        
+        # 1. 主 Loss (Sum Reduction)
+        lA = self.loss_A(pred, target, nz_ratio=nz_ratio_win, cv=cv_log_win)
 
-        # (0) Pixel reconstruction (weak supervision)
-        l_pix = self.pixel_loss(main_pred, target)
+        # 2. 辅助 Loss
+        p_for_prior = pred_100m if pred_100m is not None else pred
 
-        # (1) Pre-Consistency @ linear domain
-        pred_lin = self._to_linear(main_pred)
-        target_lin = self._to_linear(target)
+        lB = torch.zeros((), device=pred.device)
+        if self.w_sparse > 0:
+            lB = self.loss_B(p_for_prior)
+            
+        lC = torch.zeros((), device=pred.device)
+        if self.w_ent > 0:
+            lC = self.loss_C(p_for_prior)
 
-        pred_down = F.avg_pool3d(
-            pred_lin,
-            kernel_size=(1, self.scale, self.scale),
-            stride=(1, self.scale, self.scale)
-        )
-        target_down = F.avg_pool3d(
-            target_lin,
-            kernel_size=(1, self.scale, self.scale),
-            stride=(1, self.scale, self.scale)
-        )
-        l_pre = F.l1_loss(pred_down, target_down)
+        # 直接求和
+        total = lA + (self.w_sparse * lB) + (self.w_ent * lC)
 
-        # (2) Edge-aware TV
-        l_edge = self.edge_tv_loss(main_pred, aux)
-
-        # (3) Entropy
-        l_ent = self.dist_loss(main_pred)
-
-        # (4) Temporal
-        l_temp = self.temp_loss(main_pred)
-
-        losses = [l_pix, l_pre, l_edge, l_ent, l_temp]
-
-        total = 0.0
-        for i, li in enumerate(losses):
-            precision = torch.exp(-self.log_vars[i])
-            total = total + precision * li + self.log_vars[i]
+        self.last_losses = {
+            "lA_linear_sum": lA.detach(),
+            "lB_sparse": lB.detach(),
+            "lC_ent": lC.detach(),
+        }
 
         return total
